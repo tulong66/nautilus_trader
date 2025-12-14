@@ -1,0 +1,40 @@
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "marketIndex": 1,
+        "symbol": "ETH_USDC",
+        "baseAsset": "ETH",
+        "quoteAsset": "USDC",
+        "tickSize": "0.01",
+        "stepSize": "0.001",
+        "minOrderSize": "0.001",
+        "maxOrderSize": "1000",
+        "status": "active"
+      },
+      {
+        "marketIndex": 2,
+        "symbol": "BTC_USDC",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDC",
+        "tickSize": "0.1",
+        "stepSize": "0.0001",
+        "minOrderSize": "0.0001",
+        "maxOrderSize": "100",
+        "status": "active"
+      },
+      {
+        "marketIndex": 3,
+        "symbol": "SOL_USDC",
+        "baseAsset": "SOL",
+        "quoteAsset": "USDC",
+        "tickSize": "0.001",
+        "stepSize": "0.01",
+        "minOrderSize": "0.01",
+        "maxOrderSize": "10000",
+        "status": "active"
+      }
+    ]
+  }
+}

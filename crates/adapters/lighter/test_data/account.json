@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "data": {
+    "account_index": 878,
+    "address": "0x1234567890abcdef1234567890abcdef12345678",
+    "balances": {
+      "USDC": "100000.00",
+      "ETH": "10.5",
+      "BTC": "0.5"
+    },
+    "total_equity": "150000.00",
+    "free_collateral": "80000.00",
+    "margin_ratio": "0.15"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "trade_id": "100001",
+        "market_index": 1,
+        "price": "4127.50",
+        "size": "0.5",
+        "side": "buy",
+        "timestamp": 1734200000000
+      },
+      {
+        "trade_id": "100002",
+        "market_index": 1,
+        "price": "4128.00",
+        "size": "1.0",
+        "side": "sell",
+        "timestamp": 1734200001000
+      },
+      {
+        "trade_id": "100003",
+        "market_index": 1,
+        "price": "4127.80",
+        "size": "0.25",
+        "side": "buy",
+        "timestamp": 1734200002000
+      }
+    ]
+  }
+}

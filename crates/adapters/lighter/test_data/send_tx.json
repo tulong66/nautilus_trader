@@ -1,0 +1,7 @@
+{
+  "success": true,
+  "data": {
+    "txId": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+    "orderIndex": 42
+  }
+}

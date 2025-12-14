@@ -1,0 +1,115 @@
+[package]
+name = "nautilus-lighter"
+readme = "README.md"
+publish = false # Do not publish to crates.io yet
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lighter DEX integration adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_lighter"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-data/extension-module",
+  "nautilus-execution/extension-module",
+  "nautilus-model/extension-module",
+  "nautilus-network/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+python = [
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-data/python",
+  "nautilus-execution/python",
+  "nautilus-model/python",
+  "nautilus-network/python",
+  "pyo3",
+  "pyo3-async-runtimes",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-data = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-live = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+nautilus-serialization = { workspace = true }
+
+ahash = { workspace = true }
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+derive_builder = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+indexmap = { workspace = true }
+libc = "0.2"
+rmp-serde = { workspace = true }
+log = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true } # Needed for example binaries
+url = { workspace = true }
+ustr = { workspace = true }
+uuid = { workspace = true }
+
+# Lighter DEX signing (Schnorr + Poseidon2 over Goldilocks field)
+# These are used for pure Rust signing implementation without FFI
+goldilocks-crypto = "0.1.1"  # ECgFp5 curve + Schnorr signatures
+poseidon-hash = "0.1.3"       # Poseidon2 hash function
+num-bigint = "0.4"            # Big integer arithmetic for field operations
+
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+
+[dev-dependencies]
+nautilus-testkit = { workspace = true }
+axum = { workspace = true }
+criterion = { workspace = true }
+futures-util = { workspace = true }
+rstest = { workspace = true }
+tracing-test = { workspace = true }
+
+[[bin]]
+name = "lighter-ffi-poc"
+path = "bin/ffi_poc.rs"
+
+[build-dependencies]
