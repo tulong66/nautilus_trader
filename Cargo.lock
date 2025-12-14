@@ -4049,6 +4049,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "goldilocks-crypto"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8288a7e760bdd0154bbda02b668356bf3b6b4e667e31b42c136edd79575926a"
+dependencies = [
+ "hex",
+ "num-bigint",
+ "poseidon-hash",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6050,6 +6063,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-lighter"
+version = "0.52.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "criterion",
+ "dashmap",
+ "derive_builder",
+ "futures-util",
+ "goldilocks-crypto",
+ "hex",
+ "indexmap 2.12.1",
+ "libc",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-data",
+ "nautilus-execution",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-serialization",
+ "nautilus-testkit",
+ "num-bigint",
+ "poseidon-hash",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "rmp-serde",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "strum",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "url",
+ "ustr",
+ "uuid",
+]
+
+[[package]]
 name = "nautilus-live"
 version = "0.56.0"
 dependencies = [
@@ -7185,6 +7254,12 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "poseidon-hash"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9e47557a7d75aec5c6cac5c2b9aa9b9b4970a48b13c020eb41220f72a1e8b77"
 
 [[package]]
 name = "potential_utf"

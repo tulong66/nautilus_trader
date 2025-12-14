@@ -14,6 +14,7 @@ members = [
   "crates/adapters/coinbase",
   "crates/adapters/hyperliquid",
   "crates/adapters/kraken",
+  "crates/adapters/lighter",
   "crates/adapters/polymarket",
   "crates/adapters/interactive_brokers",
   "crates/adapters/okx",

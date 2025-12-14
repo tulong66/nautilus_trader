@@ -1,0 +1,31 @@
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "order_id": "12345",
+        "client_order_id": "C-001",
+        "market_index": 1,
+        "status": "open",
+        "side": "buy",
+        "order_type": "limit",
+        "price": "4100.00",
+        "quantity": "1.0",
+        "filled_quantity": "0.0",
+        "timestamp": 1734200000000
+      },
+      {
+        "order_id": "12346",
+        "client_order_id": "C-002",
+        "market_index": 1,
+        "status": "partially_filled",
+        "side": "sell",
+        "order_type": "limit",
+        "price": "4200.00",
+        "quantity": "2.0",
+        "filled_quantity": "0.5",
+        "timestamp": 1734200100000
+      }
+    ]
+  }
+}
