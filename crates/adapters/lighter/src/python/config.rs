@@ -69,6 +69,7 @@ impl LighterExecClientConfig {
         account_index,
         api_key_index,
         environment = None,
+        enable_live_signing = None,
         order_prefix = None,
         gc_interval_secs = None,
         base_url_http = None,
@@ -83,6 +84,7 @@ impl LighterExecClientConfig {
         account_index: u32,
         api_key_index: u8,
         environment: Option<LighterEnvironment>,
+        enable_live_signing: Option<bool>,
         order_prefix: Option<String>,
         gc_interval_secs: Option<u64>,
         base_url_http: Option<String>,
@@ -97,6 +99,7 @@ impl LighterExecClientConfig {
             api_key_index,
             environment.unwrap_or_default(),
         );
+        config.enable_live_signing = enable_live_signing.unwrap_or(config.enable_live_signing);
         config.order_prefix = order_prefix;
         config.gc_interval_secs = gc_interval_secs.or(config.gc_interval_secs);
         config.base_url_http = base_url_http;

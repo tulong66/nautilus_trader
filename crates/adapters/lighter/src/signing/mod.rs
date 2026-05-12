@@ -61,4 +61,7 @@ pub mod nonce;
 pub mod signer;
 
 pub use nonce::NonceManager;
-pub use signer::{LighterSigner, SignedTransaction, SigningError};
+pub use signer::{
+    LighterSigner, LighterStrategySigner, SignedTransaction, SigningError,
+    StrategySigningCapability,
+};

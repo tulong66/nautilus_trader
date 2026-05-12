@@ -92,6 +92,10 @@ pub enum SigningError {
     /// Hex decoding error.
     #[error("Hex decode error: {0}")]
     HexDecode(String),
+
+    /// Live signing is disabled by configuration.
+    #[error("Live signing is disabled; set enable_live_signing=true to allow strategy signing")]
+    LiveSigningDisabled,
 }
 
 /// A signed transaction ready for submission.
@@ -103,6 +107,31 @@ pub struct SignedTransaction {
     pub signed_hash: String,
     /// The nonce used for this transaction.
     pub nonce: u64,
+}
+
+/// Signing capabilities reachable from the strategy execution path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategySigningCapability {
+    /// Create a private WebSocket auth token.
+    CreateAuthToken,
+    /// Sign a create order transaction.
+    CreateOrder,
+    /// Sign a cancel order transaction.
+    CancelOrder,
+    /// Sign a cancel all orders transaction.
+    CancelAllOrders,
+}
+
+impl StrategySigningCapability {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateAuthToken => "create_auth_token",
+            Self::CreateOrder => "sign_create_order",
+            Self::CancelOrder => "sign_cancel_order",
+            Self::CancelAllOrders => "sign_cancel_all_orders",
+        }
+    }
 }
 
 /// Lighter transaction signer using pure Rust implementation.
@@ -568,6 +597,122 @@ impl LighterSigner {
     /// Use this for error recovery when syncing with the server.
     pub fn reset_nonce(&self, server_nonce: u64) {
         self.nonce_manager.reset(server_nonce);
+    }
+}
+
+/// Strategy-path signer wrapper.
+#[derive(Debug)]
+pub struct LighterStrategySigner {
+    inner: LighterSigner,
+    live_signing_enabled: bool,
+}
+
+impl LighterStrategySigner {
+    #[must_use]
+    pub const fn new(inner: LighterSigner, live_signing_enabled: bool) -> Self {
+        Self {
+            inner,
+            live_signing_enabled,
+        }
+    }
+
+    #[must_use]
+    pub const fn live_signing_enabled(&self) -> bool {
+        self.live_signing_enabled
+    }
+
+    #[must_use]
+    pub const fn strategy_signing_surface() -> [&'static str; 4] {
+        LighterSigner::strategy_signing_surface()
+    }
+
+    fn ensure_allowed(&self, _capability: StrategySigningCapability) -> Result<(), SigningError> {
+        if !self.live_signing_enabled {
+            return Err(SigningError::LiveSigningDisabled);
+        }
+        Ok(())
+    }
+
+    pub fn create_auth_token(&self, deadline: i64) -> Result<String, SigningError> {
+        self.ensure_allowed(StrategySigningCapability::CreateAuthToken)?;
+        self.inner.create_auth_token(deadline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_create_order(
+        &self,
+        market_index: u16,
+        client_order_index: i64,
+        base_amount: i64,
+        price: u32,
+        is_ask: bool,
+        order_type: u8,
+        time_in_force: u8,
+        reduce_only: bool,
+        trigger_price: u32,
+        order_expiry: i64,
+        expired_at: i64,
+    ) -> Result<(SignedTransaction, u64), SigningError> {
+        self.ensure_allowed(StrategySigningCapability::CreateOrder)?;
+        self.inner.sign_create_order(
+            market_index,
+            client_order_index,
+            base_amount,
+            price,
+            is_ask,
+            order_type,
+            time_in_force,
+            reduce_only,
+            trigger_price,
+            order_expiry,
+            expired_at,
+        )
+    }
+
+    pub fn sign_cancel_order(
+        &self,
+        market_index: u16,
+        order_index: i64,
+        expired_at: i64,
+    ) -> Result<(SignedTransaction, u64), SigningError> {
+        self.ensure_allowed(StrategySigningCapability::CancelOrder)?;
+        self.inner
+            .sign_cancel_order(market_index, order_index, expired_at)
+    }
+
+    pub fn sign_cancel_all_orders(
+        &self,
+        time_in_force: u8,
+        time: i64,
+        expired_at: i64,
+    ) -> Result<(SignedTransaction, u64), SigningError> {
+        self.ensure_allowed(StrategySigningCapability::CancelAllOrders)?;
+        self.inner
+            .sign_cancel_all_orders(time_in_force, time, expired_at)
+    }
+
+    pub fn reset_nonce(&self, server_nonce: u64) {
+        self.inner.reset_nonce(server_nonce);
+    }
+
+    #[must_use]
+    pub const fn api_key_index(&self) -> u8 {
+        self.inner.api_key_index()
+    }
+
+    #[must_use]
+    pub const fn account_index(&self) -> i64 {
+        self.inner.account_index()
+    }
+
+    #[must_use]
+    pub const fn chain_id(&self) -> u32 {
+        self.inner.chain_id()
+    }
+
+    #[must_use]
+    pub fn current_nonce(&self) -> u64 {
+        self.inner.current_nonce()
     }
 }
 

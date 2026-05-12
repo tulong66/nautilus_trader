@@ -62,7 +62,7 @@ use crate::{
             Market, NextNonceResponse, TxResponse,
         },
     },
-    signing::{LighterSigner, NonceManager},
+    signing::{LighterSigner, LighterStrategySigner, NonceManager},
     websocket::{client::LighterWebSocketClient, messages::InboundMessage},
 };
 
@@ -194,8 +194,8 @@ pub struct LighterExecutionClient {
     http_client: Arc<LighterRawHttpClient>,
     /// WebSocket client for real-time updates.
     ws_client: LighterWebSocketClient,
-    /// Transaction signer.
-    signer: LighterSigner,
+    /// Strategy-path transaction signer.
+    signer: LighterStrategySigner,
     /// Nonce manager for transaction ordering.
     nonce_manager: Arc<Mutex<NonceManager>>,
     /// Cached instruments (InstrumentId -> InstrumentAny).
@@ -269,6 +269,7 @@ impl LighterExecutionClient {
             0, // Initial nonce - will be fetched from server on connect
         )
         .map_err(|e| LighterError::Internal(format!("Failed to create signer: {e}")))?;
+        let signer = LighterStrategySigner::new(signer, config.enable_live_signing);
 
         // Create HTTP client
         let http_client = LighterRawHttpClient::new(
@@ -357,6 +358,15 @@ impl LighterExecutionClient {
     #[allow(dead_code)] // Will be used for sequential transaction signing
     fn get_next_nonce(&self) -> u64 {
         self.nonce_manager.lock().expect(MUTEX_POISONED).next()
+    }
+
+    fn ensure_live_signing_enabled(&self) -> anyhow::Result<()> {
+        if !self.config.enable_live_signing {
+            anyhow::bail!(
+                "Lighter live signing is disabled; set enable_live_signing=true to connect the private execution client"
+            );
+        }
+        Ok(())
     }
 
     /// Cache instruments for lookups.
@@ -1096,6 +1106,8 @@ impl ExecutionClient for LighterExecutionClient {
             return Ok(());
         }
 
+        self.ensure_live_signing_enabled()?;
+
         info!("Connecting to Lighter DEX");
 
         // Step 1: Fetch instruments/markets from HTTP API
@@ -1437,6 +1449,32 @@ mod tests {
         assert_eq!(mass_status.order_reports().len(), 6);
         assert_eq!(mass_status.fill_reports().len(), 1);
         assert_eq!(mass_status.position_reports().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_default_config_before_live_signing_or_private_ws() {
+        let mut client = test_execution_client();
+
+        let err = client
+            .connect()
+            .await
+            .expect_err("default config must not enter live signing");
+
+        assert!(
+            err.to_string().contains("Live signing is disabled")
+                || err.to_string().contains("live signing is disabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn live_signing_gate_allows_explicit_opt_in() {
+        let mut client = test_execution_client();
+        client.config.enable_live_signing = true;
+
+        client
+            .ensure_live_signing_enabled()
+            .expect("explicit opt-in should pass local gate");
     }
 
     #[test]

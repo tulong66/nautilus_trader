@@ -59,7 +59,7 @@
 
 | ID | 任务 | 状态 | 可并行性 | 验收标准 |
 |----|------|------|----------|----------|
-| J | Signer wrapper / capability whitelist / stage gate：把 create order / cancel order / cancel all / auth token 之外的签名能力从策略路径硬隔离 | [ ] | 前置 | 默认配置无法进入 live signing；测试覆盖 withdraw/transfer/leverage/margin 等能力不在策略 surface；无真实 key/secret 读取 |
+| J | Signer wrapper / capability whitelist / stage gate：把 create order / cancel order / cancel all / auth token 之外的签名能力从策略路径硬隔离 | [x] | 前置 | `LighterExecClientConfig.enable_live_signing` 默认关闭；`LighterExecutionClient` 只持有 `LighterStrategySigner` wrapper；`connect()` 在任何 HTTP/private WS/auth token 前拒绝默认配置；tests 覆盖 denied surface、disabled gate、explicit opt-in；无 env/key/secret 读取 |
 | K | Private WS/auth dry-run harness：建立可注入 token/auth stub 与 private channel 订阅重放测试 | [ ] | J 后可并行 | 使用 fixture/stub 验证 auth/subscription/order/account message flow；不读取 `.env`；不连接真实 private WS |
 | L | Live report API 设计与 mock server 接入：为 order/fill/position/mass report 设计真实数据来源接口，但只用 mock server 验证 | [ ] | J 后可并行 | 默认 live 路径仍受 stage gate 保护；mock REST/WS 能返回确定性 reports；空结果/错误/分页语义有测试 |
 | M | Execution state reconciliation：建立 send/order update/account update/fill/cancel/cancel-reject 的状态机与去重规则 | [ ] | J 后可并行 | fixture/replay 覆盖 partial fill、filled、canceled、cancel rejected、重复消息、乱序消息；不产生真实订单 |

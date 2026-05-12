@@ -209,6 +209,8 @@ pub struct LighterExecClientConfig {
     pub api_key_index: u8,
     /// Environment (Mainnet/Testnet).
     pub environment: LighterEnvironment,
+    /// Explicit opt-in gate for live signing and private execution connectivity.
+    pub enable_live_signing: bool,
     /// Order ID prefix for filtering (optional).
     pub order_prefix: Option<String>,
     /// GC interval for stale orders in seconds (default: 300).
@@ -239,6 +241,7 @@ impl LighterExecClientConfig {
             account_index,
             api_key_index,
             environment,
+            enable_live_signing: false,
             order_prefix: None,
             gc_interval_secs: Some(300),
             base_url_http: None,
@@ -302,5 +305,18 @@ mod tests {
         assert_eq!(config.chain_id(), chain_id::TESTNET);
         assert_eq!(config.api_key_index, 2);
         assert_eq!(config.account_index, 878);
+    }
+
+    #[test]
+    fn test_exec_config_disables_live_signing_by_default() {
+        let config = LighterExecClientConfig::new(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            42,
+            2,
+            LighterEnvironment::Testnet,
+        );
+
+        assert!(!config.enable_live_signing);
     }
 }
