@@ -44,10 +44,10 @@
 | C | WebSocket account update dispatch：把 private `AccountUpdate` 映射为账户余额/状态更新候选，而不是只写 log | [x] | A 后可并行 | 已新增 account dispatch outcome；mock account update 能生成 account state/report outcome；不使用真实 token |
 | D | Order status reports：实现 `generate_order_status_report(s)` 的 fixture-backed 转换、过滤和空结果语义 | [x] | A 后可并行 | 已新增 `execution::reports` 与 `tests/execution_reports.rs`；open/filled/canceled/rejected fixtures 可转 Nautilus `OrderStatusReport` |
 | E | Fill / position / mass reports：实现 `generate_fill_reports`、`generate_position_status_reports`、`generate_mass_status` | [x] | A 后可并行 | fill/position fixtures 可转 Nautilus reports；mass status 汇总 orders/fills/positions |
-| F | Execution client wiring：把 B/C/D/E 的纯转换层接入 `LighterExecutionClient`，保留 mock/offline 可测路径 | [ ] | 依赖 B/C/D/E | `cargo +1.95.0 check -p nautilus-lighter --features python` 通过；不新增 live 默认路径 |
+| F | Execution client wiring：把 B/C/D/E 的纯转换层接入 `LighterExecutionClient`，保留 mock/offline 可测路径 | [x] | 依赖 B/C/D/E | `process_ws_message` 已接入 `dispatch_private_message`；report 方法仅在显式 offline fixture 参数/哨兵下返回 fixture-backed 报告，默认 live 路径仍为空并 warning；`cargo +1.95.0 check -p nautilus-lighter --features python` 通过；不新增 live 默认路径 |
 | G | Market cache / precision cleanup：执行侧从真实 market cache 获取 `market_index`、`price_decimals`、`size_decimals`，移除 ETH/BTC/SOL/DOGE 硬编码 | [x] | A 后可并行 | `get_market_index` 已改为 cache-only；`market_index_lookup_uses_cache_not_symbol_heuristics` 覆盖未知市场；execution client 不再含 ETH/BTC/SOL/DOGE symbol fallback |
 | H | Safety surface audit：确认 signing surface 只暴露 create order / cancel order / cancel all / auth token；withdraw/transfer/leverage/margin 不进入策略路径 | [x] | 可并行 | `signing_surface` 测试证明 strategy surface 只列 create/auth/cancel/cancel-all；代码搜索未发现 withdraw/transfer/leverage/margin 签名路径 |
-| I | Verification + docs：运行完整验证并更新本状态报告、Track B plan 指针 | [ ] | 收尾 | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python import smoke test 通过；本任务板按实际完成状态更新 |
+| I | Verification + docs：运行完整验证并更新本状态报告、Track B plan 指针 | [x] | 收尾 | `cargo +1.95.0 test -p nautilus-lighter` 通过（129 passed, 2 ignored）；`cargo +1.95.0 check -p nautilus-lighter --features python` 通过；Python import smoke test 3 passed；本任务板已按实际完成状态更新 |
 
 ### P1 — 安全边界
 

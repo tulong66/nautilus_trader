@@ -13,10 +13,17 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use crate::{
-    execution::fixtures::OrderFixtureStatus,
-    websocket::messages::InboundMessage,
-};
+use crate::websocket::messages::InboundMessage;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OrderDispatchStatus {
+    Accepted,
+    Rejected,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    CancelRejected,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOutcome {
@@ -24,7 +31,7 @@ pub enum DispatchOutcome {
         order_id: String,
         client_order_id: Option<String>,
         market_index: u16,
-        status: OrderFixtureStatus,
+        status: OrderDispatchStatus,
         venue_status: String,
     },
     Account {
@@ -64,14 +71,14 @@ pub fn dispatch_private_message(message: &InboundMessage) -> DispatchOutcome {
     }
 }
 
-fn order_status_from_lighter(status: &str) -> OrderFixtureStatus {
+fn order_status_from_lighter(status: &str) -> OrderDispatchStatus {
     match status {
-        "open" => OrderFixtureStatus::Accepted,
-        "rejected" => OrderFixtureStatus::Rejected,
-        "partially_filled" => OrderFixtureStatus::PartiallyFilled,
-        "filled" => OrderFixtureStatus::Filled,
-        "canceled" | "cancelled" => OrderFixtureStatus::Canceled,
-        "cancel_rejected" => OrderFixtureStatus::CancelRejected,
-        _ => OrderFixtureStatus::Rejected,
+        "open" => OrderDispatchStatus::Accepted,
+        "rejected" => OrderDispatchStatus::Rejected,
+        "partially_filled" => OrderDispatchStatus::PartiallyFilled,
+        "filled" => OrderDispatchStatus::Filled,
+        "canceled" | "cancelled" => OrderDispatchStatus::Canceled,
+        "cancel_rejected" => OrderDispatchStatus::CancelRejected,
+        _ => OrderDispatchStatus::Rejected,
     }
 }

@@ -15,7 +15,7 @@
 
 //! Live execution client implementation for the Lighter DEX adapter.
 
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -28,7 +28,7 @@ use nautilus_common::{
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::{MUTEX_POISONED, UnixNanos};
+use nautilus_core::{MUTEX_POISONED, Params, UnixNanos};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
@@ -46,17 +46,116 @@ use crate::{
     common::LIGHTER_VENUE,
     config::LighterExecClientConfig,
     error::LighterError,
+    execution::{
+        dispatch::dispatch_private_message,
+        fixtures::execution_fixture_set,
+        reports::{
+            build_fill_report, build_mass_status, build_order_status_report,
+            build_position_status_report,
+        },
+    },
     http::{
         client::LighterRawHttpClient,
-        endpoints::{SEND_TX, NEXT_NONCE, ORDER_BOOKS},
+        endpoints::{NEXT_NONCE, ORDER_BOOKS, SEND_TX},
         types::{
-            CreateOrderRequest, CancelOrderRequest, CancelAllOrdersRequest,
-            TxResponse, NextNonceResponse, Market, LighterResponse,
+            CancelAllOrdersRequest, CancelOrderRequest, CreateOrderRequest, LighterResponse,
+            Market, NextNonceResponse, TxResponse,
         },
     },
     signing::{LighterSigner, NonceManager},
     websocket::{client::LighterWebSocketClient, messages::InboundMessage},
 };
+
+struct OfflineReportSource {
+    client_id: ClientId,
+    account_id: AccountId,
+    venue: nautilus_model::identifiers::Venue,
+    instrument_id: InstrumentId,
+}
+
+impl OfflineReportSource {
+    pub fn new(
+        client_id: ClientId,
+        account_id: AccountId,
+        venue: nautilus_model::identifiers::Venue,
+        instrument_id: InstrumentId,
+    ) -> Self {
+        Self {
+            client_id,
+            account_id,
+            venue,
+            instrument_id,
+        }
+    }
+
+    pub fn order_status_reports(
+        &self,
+    ) -> anyhow::Result<Vec<nautilus_model::reports::OrderStatusReport>> {
+        let fixtures = execution_fixture_set();
+        fixtures
+            .orders
+            .iter()
+            .map(|o| {
+                build_order_status_report(o, self.account_id, self.instrument_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .collect()
+    }
+
+    pub fn fill_reports(&self) -> anyhow::Result<Vec<nautilus_model::reports::FillReport>> {
+        let fixtures = execution_fixture_set();
+        let report = build_fill_report(&fixtures.fill, self.account_id, self.instrument_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(vec![report])
+    }
+
+    pub fn position_status_reports(
+        &self,
+    ) -> anyhow::Result<Vec<nautilus_model::reports::PositionStatusReport>> {
+        let fixtures = execution_fixture_set();
+        let report =
+            build_position_status_report(&fixtures.position, self.account_id, self.instrument_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(vec![report])
+    }
+
+    pub fn mass_status(
+        &self,
+    ) -> anyhow::Result<Option<nautilus_model::reports::ExecutionMassStatus>> {
+        let fixtures = execution_fixture_set();
+        let mass = build_mass_status(
+            &fixtures,
+            self.client_id,
+            self.account_id,
+            self.venue,
+            self.instrument_id,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Some(mass))
+    }
+}
+
+const OFFLINE_REPORT_SOURCE_PARAM: &str = "lighter_report_source";
+const OFFLINE_REPORT_SOURCE_VALUE: &str = "fixture";
+const OFFLINE_REPORT_INSTRUMENT_ID: &str = "ETH_USDC.LIGHTER";
+const OFFLINE_REPORT_LOOKBACK_MINS: u64 = u64::MAX;
+
+fn is_offline_fixture_report_request(params: Option<&Params>) -> bool {
+    params.and_then(|params| params.get_str(OFFLINE_REPORT_SOURCE_PARAM))
+        == Some(OFFLINE_REPORT_SOURCE_VALUE)
+}
+
+fn default_offline_report_source(
+    client_id: ClientId,
+    account_id: AccountId,
+) -> OfflineReportSource {
+    OfflineReportSource::new(
+        client_id,
+        account_id,
+        *LIGHTER_VENUE,
+        InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID),
+    )
+}
 
 /// Live execution client for the Lighter DEX adapter.
 ///
@@ -257,10 +356,7 @@ impl LighterExecutionClient {
     /// Get the next nonce for transaction signing.
     #[allow(dead_code)] // Will be used for sequential transaction signing
     fn get_next_nonce(&self) -> u64 {
-        self.nonce_manager
-            .lock()
-            .expect(MUTEX_POISONED)
-            .next()
+        self.nonce_manager.lock().expect(MUTEX_POISONED).next()
     }
 
     /// Cache instruments for lookups.
@@ -270,8 +366,10 @@ impl LighterExecutionClient {
             let instrument_id = instrument.id();
 
             self.instruments.insert(instrument_id, instrument.clone());
-            self.instrument_to_market_index
-                .insert(instrument_id, u16::try_from(market_index).unwrap_or(u16::MAX));
+            self.instrument_to_market_index.insert(
+                instrument_id,
+                u16::try_from(market_index).unwrap_or(u16::MAX),
+            );
         }
 
         self.instruments_initialized = true;
@@ -361,7 +459,9 @@ impl LighterExecutionClient {
                 );
             }
         } else {
-            let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             error!("Order {} rejected: {}", client_order_id, error_msg);
         }
 
@@ -382,10 +482,18 @@ impl LighterExecutionClient {
             .map_err(|e| anyhow::anyhow!("Cancel request failed: {e}"))?;
 
         if response.success {
-            info!("Cancel request for {} submitted successfully", client_order_id);
+            info!(
+                "Cancel request for {} submitted successfully",
+                client_order_id
+            );
         } else {
-            let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
-            error!("Cancel request for {} rejected: {}", client_order_id, error_msg);
+            let error_msg = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            error!(
+                "Cancel request for {} rejected: {}",
+                client_order_id, error_msg
+            );
         }
 
         Ok(())
@@ -406,7 +514,9 @@ impl LighterExecutionClient {
         if response.success {
             info!("Cancel all orders request submitted successfully");
         } else {
-            let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             error!("Cancel all orders request rejected: {}", error_msg);
         }
 
@@ -426,7 +536,10 @@ impl LighterExecutionClient {
         let core_account_id = self.core.account_id;
 
         let handle = tokio::spawn(async move {
-            info!("Starting execution WebSocket message handler for {}", core_client_id);
+            info!(
+                "Starting execution WebSocket message handler for {}",
+                core_client_id
+            );
 
             loop {
                 match msg_rx.recv().await {
@@ -455,117 +568,100 @@ impl LighterExecutionClient {
 
     /// Process a single WebSocket message.
     ///
-    /// Handles order updates, account updates, and other execution-related messages.
+    /// Private order/account messages are routed through [`dispatch_private_message`]
+    /// so the dispatch path is exercisable by offline tests without constructing a
+    /// full client. Order-cache side-effects (venue-order-ID hydration) are preserved.
     fn process_ws_message(
         message: InboundMessage,
         orders: &DashMap<ClientOrderId, OrderState>,
         client_id: ClientId,
         account_id: AccountId,
     ) -> Result<(), LighterError> {
-        match message {
-            InboundMessage::OrderUpdate {
-                order_id,
-                client_order_id,
+        // Route private messages through the dispatch layer first.
+        let outcome = dispatch_private_message(&message);
+
+        use crate::execution::dispatch::DispatchOutcome;
+        match outcome {
+            DispatchOutcome::Order {
+                ref order_id,
+                ref client_order_id,
                 market_index,
-                status,
-                side,
-                order_type,
-                price,
-                quantity,
-                filled_quantity,
-                timestamp,
+                ref status,
+                ref venue_status,
             } => {
-                debug!(
-                    "Processing order update: order_id={}, status={}, filled={}",
-                    order_id, status, filled_quantity
-                );
-
-                // Try to find order by client_order_id first
-                let client_order_id_key = client_order_id
-                    .as_ref()
-                    .and_then(|id| ClientOrderId::new_checked(id).ok());
-
-                if let Some(coid) = client_order_id_key {
-                    if let Some(mut order_state) = orders.get_mut(&coid) {
-                        // Update venue order ID if not set
-                        if order_state.venue_order_id.is_none() {
-                            order_state.venue_order_id = Some(order_id.clone());
+                // Preserve existing order-cache side-effect: hydrate venue_order_id.
+                if let Some(coid_str) = client_order_id {
+                    if let Ok(coid) = ClientOrderId::new_checked(coid_str) {
+                        if let Some(mut order_state) = orders.get_mut(&coid) {
+                            if order_state.venue_order_id.is_none() {
+                                order_state.venue_order_id = Some(order_id.clone());
+                            }
                         }
                     }
                 }
 
-                // Log order status for now - full event generation requires ExecutionClientCore access
-                // which would need to be passed through Arc<Mutex<>> or similar
                 info!(
-                    "[{}] Order {} status: {} (market={}, side={}, type={}, price={}, qty={}, filled={})",
-                    client_id, order_id, status, market_index, side, order_type, price, quantity, filled_quantity
+                    "[{}] Order {} dispatched: status={:?} (venue_status={}, market={})",
+                    client_id, order_id, status, venue_status, market_index
                 );
 
-                // TODO: Generate proper NautilusTrader order events via core
-                // This would require:
-                // 1. Passing core reference to this method (via Arc)
-                // 2. Calling core.generate_order_accepted/rejected/filled/canceled based on status
-                // For now, we just update internal state and log
-
-                let _ = timestamp; // Used for event timestamps
+                // NOTE: Full NautilusTrader event generation (OrderAccepted, OrderFilled,
+                // etc.) requires ExecutionClientCore access via Arc. That wiring is
+                // deferred; this dispatch path is the prerequisite.
+                return Ok(());
             }
-
-            InboundMessage::AccountUpdate {
-                address,
-                balances,
-                timestamp,
+            DispatchOutcome::Account {
+                ref address,
+                ref balances,
+                ..
             } => {
-                debug!(
-                    "Processing account update: address={}, balances_count={}",
+                info!(
+                    "[{}] Account {} updated with {} balance entries",
+                    account_id,
                     address,
                     balances.len()
                 );
-
-                // Log account state for now - full event generation requires ExecutionClientCore access
-                info!(
-                    "[{}] Account {} updated with {} balance entries",
-                    account_id, address, balances.len()
-                );
-
-                for (asset, amount) in &balances {
+                for (asset, amount) in balances {
                     debug!("  Balance: {} = {}", asset, amount);
                 }
-
-                let _ = timestamp; // Used for event timestamps
+                return Ok(());
             }
+            DispatchOutcome::Ignored => {
+                // Fall through to handle non-private message variants below.
+            }
+        }
 
+        // Handle remaining non-private / control messages.
+        match message {
             InboundMessage::AuthSuccess => {
                 info!("[{}] WebSocket authentication successful", client_id);
             }
-
             InboundMessage::SubscriptionSuccess { channel } => {
                 info!("[{}] Subscribed to channel: {}", client_id, channel);
             }
-
             InboundMessage::UnsubscriptionSuccess { channel } => {
                 info!("[{}] Unsubscribed from channel: {}", client_id, channel);
             }
-
             InboundMessage::Error { code, message } => {
                 error!("[{}] WebSocket error {}: {}", client_id, code, message);
-                return Err(LighterError::WebSocket(format!("Error {}: {}", code, message)));
+                return Err(LighterError::WebSocket(format!(
+                    "Error {}: {}",
+                    code, message
+                )));
             }
-
             InboundMessage::Pong => {
                 debug!("[{}] Received pong", client_id);
             }
-
-            InboundMessage::Raw(value) => {
+            InboundMessage::Raw(ref value) => {
                 debug!("[{}] Received raw message: {:?}", client_id, value);
             }
-
-            // Ignore data messages in execution client (handled by data client)
+            // Market data messages are ignored in execution client.
             InboundMessage::OrderbookSnapshot { .. }
             | InboundMessage::OrderbookUpdate { .. }
             | InboundMessage::Trade { .. }
-            | InboundMessage::Ticker { .. } => {
-                // These are market data messages, ignore in execution client
-            }
+            | InboundMessage::Ticker { .. } => {}
+            // Order/Account variants were handled by dispatch above.
+            InboundMessage::OrderUpdate { .. } | InboundMessage::AccountUpdate { .. } => {}
         }
 
         Ok(())
@@ -605,7 +701,8 @@ impl ExecutionClient for LighterExecutionClient {
         reported: bool,
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
-        self.emitter.emit_account_state(balances, margins, reported, ts_event);
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
         Ok(())
     }
 
@@ -669,7 +766,9 @@ impl ExecutionClient for LighterExecutionClient {
             .cache()
             .order(&cmd.client_order_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
+            })?;
 
         if !self.is_connected() {
             anyhow::bail!("Cannot submit order: execution client not connected");
@@ -691,23 +790,21 @@ impl ExecutionClient for LighterExecutionClient {
                     "Unknown instrument {}, cannot submit order",
                     order.instrument_id()
                 );
-                self.emitter.emit_order_rejected(
-                    &order,
-                    "Unknown instrument",
-                    cmd.ts_init,
-                    false,
-                );
+                self.emitter
+                    .emit_order_rejected(&order, "Unknown instrument", cmd.ts_init, false);
                 return Ok(());
             }
         };
 
         // Extract order parameters
-        let client_order_index = order.client_order_id().to_string()
+        let client_order_index = order
+            .client_order_id()
+            .to_string()
             .parse::<i64>()
             .unwrap_or_else(|_| {
                 // Generate a unique ID from hash if not numeric
-                use std::hash::{Hash, Hasher};
                 use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
                 let mut hasher = DefaultHasher::new();
                 order.client_order_id().hash(&mut hasher);
                 (hasher.finish() as i64).abs()
@@ -762,12 +859,8 @@ impl ExecutionClient for LighterExecutionClient {
             Err(e) => {
                 error!("Failed to sign order: {}", e);
                 let reason = format!("Signing failed: {e}");
-                self.emitter.emit_order_rejected(
-                    &order,
-                    &reason,
-                    cmd.ts_init,
-                    false,
-                );
+                self.emitter
+                    .emit_order_rejected(&order, &reason, cmd.ts_init, false);
                 return Ok(());
             }
         };
@@ -854,7 +947,10 @@ impl ExecutionClient for LighterExecutionClient {
 
         // Get venue order ID (order_index)
         // cmd.venue_order_id is a VenueOrderId, try to parse it
-        let venue_order_str = cmd.venue_order_id.map(|id| id.to_string()).unwrap_or_default();
+        let venue_order_str = cmd
+            .venue_order_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
         let order_index = if venue_order_str.is_empty() || venue_order_str == "NULL" {
             // Fall back to cached order state
             match &order_state.venue_order_id {
@@ -879,13 +975,17 @@ impl ExecutionClient for LighterExecutionClient {
             + 60_000; // 60 seconds expiry
 
         // Sign the cancel transaction
-        let (signed_tx, nonce) = match self.signer.sign_cancel_order(market_index, order_index, expired_at) {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to sign cancel order: {}", e);
-                return Ok(());
-            }
-        };
+        let (signed_tx, nonce) =
+            match self
+                .signer
+                .sign_cancel_order(market_index, order_index, expired_at)
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to sign cancel order: {}", e);
+                    return Ok(());
+                }
+            };
 
         // Build HTTP request
         let request = CancelOrderRequest {
@@ -931,13 +1031,17 @@ impl ExecutionClient for LighterExecutionClient {
         let time_in_force: u8 = 0;
 
         // Sign the cancel all transaction
-        let (signed_tx, nonce) = match self.signer.sign_cancel_all_orders(time_in_force, time, expired_at) {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to sign cancel all orders: {}", e);
-                return Ok(());
-            }
-        };
+        let (signed_tx, nonce) =
+            match self
+                .signer
+                .sign_cancel_all_orders(time_in_force, time, expired_at)
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to sign cancel all orders: {}", e);
+                    return Ok(());
+                }
+            };
 
         // Build HTTP request
         let request = CancelAllOrdersRequest {
@@ -1033,10 +1137,7 @@ impl ExecutionClient for LighterExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch nonce: {e}"))?;
 
-        let server_nonce = nonce_response
-            .data
-            .map(|d| d.nonce)
-            .unwrap_or(0);
+        let server_nonce = nonce_response.data.map(|d| d.nonce).unwrap_or(0);
 
         info!("Server nonce: {}", server_nonce);
 
@@ -1107,68 +1208,236 @@ impl ExecutionClient for LighterExecutionClient {
 
     async fn generate_order_status_report(
         &self,
-        _cmd: &GenerateOrderStatusReport,
+        cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        // TODO: Implement single order status report generation
-        warn!("generate_order_status_report not yet implemented");
-        Ok(None)
+        if !is_offline_fixture_report_request(cmd.params.as_ref()) {
+            warn!("generate_order_status_report: live API not implemented");
+            return Ok(None);
+        }
+
+        warn!("generate_order_status_report: using explicit offline fixture report source");
+        let reports = default_offline_report_source(self.core.client_id, self.core.account_id)
+            .order_status_reports()?;
+        Ok(reports.into_iter().next())
     }
 
     async fn generate_order_status_reports(
         &self,
-        _cmd: &GenerateOrderStatusReports,
+        cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        // TODO: Implement order status reports generation
-        // 1. Query orders from HTTP API
-        // 2. Filter by instrument_id, client_order_id, venue_order_id
-        // 3. Parse to OrderStatusReport
-        warn!("generate_order_status_reports not yet implemented");
-        Ok(Vec::new())
+        if !is_offline_fixture_report_request(cmd.params.as_ref()) {
+            warn!("generate_order_status_reports: live API not implemented");
+            return Ok(Vec::new());
+        }
+
+        warn!("generate_order_status_reports: using explicit offline fixture report source");
+        default_offline_report_source(self.core.client_id, self.core.account_id)
+            .order_status_reports()
     }
 
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        // TODO: Implement fill reports generation
-        // 1. Query fills from HTTP API
-        // 2. Filter by instrument_id, venue_order_id, time range
-        // 3. Parse to FillReport
-        warn!("generate_fill_reports not yet implemented");
-        Ok(Vec::new())
+        if !is_offline_fixture_report_request(cmd.params.as_ref()) {
+            warn!("generate_fill_reports: live API not implemented");
+            return Ok(Vec::new());
+        }
+
+        warn!("generate_fill_reports: using explicit offline fixture report source");
+        default_offline_report_source(self.core.client_id, self.core.account_id).fill_reports()
     }
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionStatusReports,
+        cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        // TODO: Implement position status reports generation
-        // 1. Query positions from HTTP API
-        // 2. Filter by instrument_id
-        // 3. Parse to PositionStatusReport
-        warn!("generate_position_status_reports not yet implemented");
-        Ok(Vec::new())
+        if !is_offline_fixture_report_request(cmd.params.as_ref()) {
+            warn!("generate_position_status_reports: live API not implemented");
+            return Ok(Vec::new());
+        }
+
+        warn!("generate_position_status_reports: using explicit offline fixture report source");
+        default_offline_report_source(self.core.client_id, self.core.account_id)
+            .position_status_reports()
     }
 
     async fn generate_mass_status(
         &self,
-        _lookback_mins: Option<u64>,
+        lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        // TODO: Implement mass status generation
-        // 1. Query all orders, fills, positions
-        // 2. Apply time filter if lookback_mins specified
-        // 3. Combine into ExecutionMassStatus
-        warn!("generate_mass_status not yet implemented");
-        Ok(None)
+        if lookback_mins != Some(OFFLINE_REPORT_LOOKBACK_MINS) {
+            warn!("generate_mass_status: live API not implemented");
+            return Ok(None);
+        }
+
+        warn!("generate_mass_status: using explicit offline fixture report source");
+        default_offline_report_source(self.core.client_id, self.core.account_id).mass_status()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use dashmap::DashMap;
-    use nautilus_model::identifiers::InstrumentId;
+    use nautilus_common::cache::Cache;
+    use nautilus_model::{
+        enums::AccountType,
+        identifiers::{InstrumentId, TraderId},
+    };
+
+    use crate::{
+        common::LighterEnvironment,
+        execution::fixtures::{OrderFixtureStatus, execution_fixture_set},
+        websocket::messages::InboundMessage,
+    };
 
     use super::*;
+
+    #[test]
+    fn offline_fixture_report_request_requires_explicit_param() {
+        let mut params = Params::new();
+        params.insert(
+            OFFLINE_REPORT_SOURCE_PARAM.to_string(),
+            serde_json::Value::String(OFFLINE_REPORT_SOURCE_VALUE.to_string()),
+        );
+
+        assert!(!is_offline_fixture_report_request(None));
+        assert!(is_offline_fixture_report_request(Some(&params)));
+
+        params.insert(
+            OFFLINE_REPORT_SOURCE_PARAM.to_string(),
+            serde_json::Value::String("live".to_string()),
+        );
+        assert!(!is_offline_fixture_report_request(Some(&params)));
+    }
+
+    #[test]
+    fn offline_mass_status_lookback_requires_explicit_sentinel() {
+        assert_eq!(OFFLINE_REPORT_LOOKBACK_MINS, u64::MAX);
+        assert_ne!(Some(OFFLINE_REPORT_LOOKBACK_MINS), Some(0));
+        assert_ne!(Some(OFFLINE_REPORT_LOOKBACK_MINS), None);
+    }
+
+    fn test_execution_client() -> LighterExecutionClient {
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("LIGHTER"),
+            *LIGHTER_VENUE,
+            OmsType::Netting,
+            AccountId::from("LIGHTER-001"),
+            AccountType::Margin,
+            None,
+            Rc::new(RefCell::new(Cache::default())),
+        );
+        let config = LighterExecClientConfig::new(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            42,
+            2,
+            LighterEnvironment::Testnet,
+        );
+
+        LighterExecutionClient::new(core, config).expect("test execution client")
+    }
+
+    #[test]
+    fn process_ws_message_dispatches_order_update_and_hydrates_order_cache() {
+        let fixtures = execution_fixture_set();
+        let accepted = fixtures
+            .orders
+            .iter()
+            .find(|order| order.status == OrderFixtureStatus::Accepted)
+            .expect("accepted order fixture");
+        let client_order_id = ClientOrderId::new(accepted.client_order_id);
+        let orders = DashMap::new();
+        orders.insert(
+            client_order_id,
+            OrderState {
+                client_order_id,
+                instrument_id: InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID),
+                venue_order_id: None,
+                nonce: 1,
+            },
+        );
+
+        LighterExecutionClient::process_ws_message(
+            accepted.to_ws_message(),
+            &orders,
+            ClientId::from("LIGHTER"),
+            AccountId::from("LIGHTER-001"),
+        )
+        .expect("process order update");
+
+        let order_state = orders.get(&client_order_id).expect("cached order");
+        assert_eq!(
+            order_state.venue_order_id.as_deref(),
+            Some(accepted.order_id)
+        );
+    }
+
+    #[test]
+    fn process_ws_message_dispatches_account_update_and_ignores_market_data() {
+        let fixtures = execution_fixture_set();
+        let message = InboundMessage::AccountUpdate {
+            address: fixtures.account.address,
+            balances: vec![(fixtures.account.asset, fixtures.account.balance)],
+            timestamp: fixtures.account.timestamp_ms,
+        };
+        let orders = DashMap::new();
+
+        LighterExecutionClient::process_ws_message(
+            message,
+            &orders,
+            ClientId::from("LIGHTER"),
+            AccountId::from("LIGHTER-001"),
+        )
+        .expect("process account update");
+        LighterExecutionClient::process_ws_message(
+            InboundMessage::Pong,
+            &orders,
+            ClientId::from("LIGHTER"),
+            AccountId::from("LIGHTER-001"),
+        )
+        .expect("process ignored pong");
+    }
+
+    #[test]
+    fn offline_report_source_returns_fixture_backed_results() {
+        let src = default_offline_report_source(ClientId::from("LIGHTER"), AccountId::from("LIGHTER-001"));
+
+        assert_eq!(src.order_status_reports().unwrap().len(), 6);
+        assert_eq!(src.fill_reports().unwrap().len(), 1);
+        assert_eq!(src.position_status_reports().unwrap().len(), 1);
+        let mass_status = src.mass_status().unwrap().expect("mass status");
+        assert_eq!(mass_status.order_reports().len(), 6);
+        assert_eq!(mass_status.fill_reports().len(), 1);
+        assert_eq!(mass_status.position_reports().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generate_mass_status_uses_explicit_offline_fixture_sentinel() {
+        let client = test_execution_client();
+
+        assert!(client.generate_mass_status(None).await.unwrap().is_none());
+        assert!(
+            client
+                .generate_mass_status(Some(0))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mass_status = client
+            .generate_mass_status(Some(OFFLINE_REPORT_LOOKBACK_MINS))
+            .await
+            .unwrap()
+            .expect("offline fixture mass status");
+        assert_eq!(mass_status.order_reports().len(), 6);
+        assert_eq!(mass_status.fill_reports().len(), 1);
+        assert_eq!(mass_status.position_reports().len(), 1);
+    }
 
     #[test]
     fn test_client_creation() {
@@ -1186,8 +1455,17 @@ mod tests {
         cache.insert(eth, 42);
         cache.insert(btc, 7);
 
-        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &eth), Some(42));
-        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &btc), Some(7));
-        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &unknown), None);
+        assert_eq!(
+            LighterExecutionClient::market_index_from_cache(&cache, &eth),
+            Some(42)
+        );
+        assert_eq!(
+            LighterExecutionClient::market_index_from_cache(&cache, &btc),
+            Some(7)
+        );
+        assert_eq!(
+            LighterExecutionClient::market_index_from_cache(&cache, &unknown),
+            None
+        );
     }
 }

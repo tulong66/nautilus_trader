@@ -15,7 +15,7 @@
 
 use nautilus_lighter::{
     execution::{
-        dispatch::{DispatchOutcome, dispatch_private_message},
+        dispatch::{DispatchOutcome, OrderDispatchStatus, dispatch_private_message},
         fixtures::{OrderFixtureStatus, execution_fixture_set},
     },
     websocket::messages::InboundMessage,
@@ -34,7 +34,7 @@ fn dispatches_order_update_fixtures_to_order_outcomes() {
                 order_id: order.order_id.to_string(),
                 client_order_id: Some(order.client_order_id.to_string()),
                 market_index: order.market_index,
-                status: order.status,
+                status: OrderDispatchStatus::from(order.status),
                 venue_status: order.status.as_lighter_status().to_string(),
             }
         );
@@ -58,7 +58,7 @@ fn preserves_cancel_rejected_as_distinct_order_outcome() {
             order_id: order.order_id.to_string(),
             client_order_id: Some(order.client_order_id.to_string()),
             market_index: order.market_index,
-            status: OrderFixtureStatus::CancelRejected,
+            status: OrderDispatchStatus::CancelRejected,
             venue_status: "cancel_rejected".to_string(),
         }
     );
@@ -69,7 +69,10 @@ fn dispatches_account_update_fixture_to_account_outcome() {
     let fixtures = execution_fixture_set();
     let message = InboundMessage::AccountUpdate {
         address: fixtures.account.address.clone(),
-        balances: vec![(fixtures.account.asset.clone(), fixtures.account.balance.clone())],
+        balances: vec![(
+            fixtures.account.asset.clone(),
+            fixtures.account.balance.clone(),
+        )],
         timestamp: fixtures.account.timestamp_ms,
     };
 

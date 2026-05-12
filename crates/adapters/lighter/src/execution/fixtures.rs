@@ -57,6 +57,19 @@ impl OrderUpdateFixture {
     }
 }
 
+impl From<OrderFixtureStatus> for crate::execution::dispatch::OrderDispatchStatus {
+    fn from(value: OrderFixtureStatus) -> Self {
+        match value {
+            OrderFixtureStatus::Accepted => Self::Accepted,
+            OrderFixtureStatus::Rejected => Self::Rejected,
+            OrderFixtureStatus::PartiallyFilled => Self::PartiallyFilled,
+            OrderFixtureStatus::Filled => Self::Filled,
+            OrderFixtureStatus::Canceled => Self::Canceled,
+            OrderFixtureStatus::CancelRejected => Self::CancelRejected,
+        }
+    }
+}
+
 impl OrderFixtureStatus {
     #[must_use]
     pub const fn as_lighter_status(self) -> &'static str {
