@@ -141,6 +141,7 @@ pub fn parse_instrument(market: &MarketInfo) -> Result<CryptoFuture, LighterErro
         None, // margin_maint
         Some(Decimal::new(2, 4)), // maker_fee: 0.02% = 0.0002
         Some(Decimal::new(5, 4)), // taker_fee: 0.05% = 0.0005
+        None, // params
         ts_now,
         ts_now,
     )

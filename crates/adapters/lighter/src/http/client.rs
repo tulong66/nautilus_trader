@@ -51,8 +51,9 @@ use crate::{
 /// - Private endpoints: ~5 requests per second
 ///
 /// We use a conservative 5 requests per second as the default global quota.
-pub static LIGHTER_REST_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_second(NonZeroU32::new(5).unwrap()));
+pub static LIGHTER_REST_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(5).unwrap()).expect("non-zero per-second quota")
+});
 
 /// Authentication header name for Lighter API.
 const AUTH_HEADER: &str = "X-Lighter-Auth";

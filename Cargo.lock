@@ -4057,7 +4057,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "poseidon-hash",
- "rand 0.8.5",
+ "rand 0.8.6",
  "thiserror 1.0.69",
 ]
 
@@ -6064,7 +6064,7 @@ dependencies = [
 
 [[package]]
 name = "nautilus-lighter"
-version = "0.52.0"
+version = "0.56.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -6072,7 +6072,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "chrono",
  "criterion",
@@ -6081,7 +6081,7 @@ dependencies = [
  "futures-util",
  "goldilocks-crypto",
  "hex",
- "indexmap 2.12.1",
+ "indexmap 2.14.0",
  "libc",
  "log",
  "nautilus-common",
@@ -6104,8 +6104,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "strum",
- "thiserror 2.0.17",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",

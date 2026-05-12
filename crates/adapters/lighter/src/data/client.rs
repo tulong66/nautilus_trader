@@ -24,11 +24,11 @@ use ahash::AHashMap;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_common::{
+    clients::DataClient,
     live::runner::get_data_event_sender,
     messages::DataEvent,
 };
 use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
-use nautilus_data::client::DataClient;
 use nautilus_model::{
     data::{Bar, BarType},
     identifiers::{ClientId, InstrumentId, Venue},
