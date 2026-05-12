@@ -93,9 +93,9 @@ uuid = { workspace = true }
 
 # Lighter DEX signing (Schnorr + Poseidon2 over Goldilocks field)
 # These are used for pure Rust signing implementation without FFI
-goldilocks-crypto = "0.1.1"  # ECgFp5 curve + Schnorr signatures
-poseidon-hash = "0.1.3"       # Poseidon2 hash function
-num-bigint = "0.4"            # Big integer arithmetic for field operations
+goldilocks-crypto = "=0.1.1"  # ECgFp5 curve + Schnorr signatures
+poseidon-hash = "=0.1.3"       # Poseidon2 hash function
+num-bigint = "0.4"             # Big integer arithmetic for field operations
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
