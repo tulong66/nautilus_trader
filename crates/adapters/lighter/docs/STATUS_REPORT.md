@@ -29,12 +29,25 @@
 - [x] 修复 ticker 到 `QuoteTick` 的简化逻辑：不再用 last price 伪造 bid/ask；只有 ticker 携带真实 best bid/ask 和 size 时才生成 `QuoteTick`。
 - [x] 增加 public WS 数据路径测试：orderbook snapshot/update、trade、ticker，以及重连后订阅恢复消息构造。
 
-### P1 — Execution 事件闭环
+### P1 — Execution 闭环任务板
 
-- [ ] WebSocket order update 需要生成 Nautilus order accepted / rejected / filled / canceled 等执行事件。
-- [ ] WebSocket account update 需要生成账户状态事件，而不是只写 log。
-- [ ] 实现 `generate_order_status_report(s)`、`generate_fill_reports`、`generate_position_status_reports`、`generate_mass_status`。
-- [ ] 将执行侧 market_index 和 price_decimals 从真实 market cache 获取，移除 ETH/BTC/SOL/DOGE 硬编码。
+> 目标：先完成 mock/offline execution event/report 闭环，让 adapter 能被 paper/replay 验证；不推进任何真实资金路径。
+>
+> 安全边界：不读取 `.env`、wallet、key 文件；不调用 Lighter mainnet 下单；不使用真实 private WS credentials；不运行任何真实资金命令。
+>
+> 并行策略：A 是共同前置；B/C/D/E 可在 A 后并行；F 依赖 B/C/D/E；G/H/I 可与 B/C/D/E 并行推进；完成一项就勾掉一项，若发现新缺口可在本节动态增删改。
+
+| ID | 任务 | 状态 | 可并行性 | 验收标准 |
+|----|------|------|----------|----------|
+| A | 建立 execution fixture 基础层：定义 offline order/account/fill/position fixtures，覆盖 accepted/rejected/partial fill/filled/canceled/cancel rejected/account update | [ ] | 前置 | fixture 不含真实凭证；`cargo +1.95.0 test -p nautilus-lighter --test execution_*` 可运行 |
+| B | WebSocket order update dispatch：把 private `OrderUpdate` 映射为 Nautilus accepted/rejected/filled/canceled/cancel-rejected 等执行事件候选 | [ ] | A 后可并行 | mock WS message 能生成确定性 dispatch outcome；不连接真实 private WS |
+| C | WebSocket account update dispatch：把 private `AccountUpdate` 映射为账户余额/状态更新候选，而不是只写 log | [ ] | A 后可并行 | mock account update 能生成 account state/report outcome；不使用真实 token |
+| D | Order status reports：实现 `generate_order_status_report(s)` 的 fixture-backed 转换、过滤和空结果语义 | [ ] | A 后可并行 | open/filled/canceled/rejected fixtures 可转 Nautilus `OrderStatusReport`；过滤条件有测试 |
+| E | Fill / position / mass reports：实现 `generate_fill_reports`、`generate_position_status_reports`、`generate_mass_status` | [ ] | A 后可并行 | fill/position fixtures 可转 report；mass status 汇总 orders/fills/positions |
+| F | Execution client wiring：把 B/C/D/E 的纯转换层接入 `LighterExecutionClient`，保留 mock/offline 可测路径 | [ ] | 依赖 B/C/D/E | `cargo +1.95.0 check -p nautilus-lighter --features python` 通过；不新增 live 默认路径 |
+| G | Market cache / precision cleanup：执行侧从真实 market cache 获取 `market_index`、`price_decimals`、`size_decimals`，移除 ETH/BTC/SOL/DOGE 硬编码 | [ ] | A 后可并行 | submit/cancel/report 转换不依赖 symbol 硬编码；有 fixture 覆盖未知市场 |
+| H | Safety surface audit：确认 signing surface 只暴露 create order / cancel order / cancel all / auth token；withdraw/transfer/leverage/margin 不进入策略路径 | [ ] | 可并行 | 代码搜索和测试证明策略层不可调用 withdraw/transfer；文档记录 no-withdraw/no-transfer surface |
+| I | Verification + docs：运行完整验证并更新本状态报告、Track B plan 指针 | [ ] | 收尾 | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python import smoke test 通过；本任务板按实际完成状态更新 |
 
 ### P1 — 安全边界
 
