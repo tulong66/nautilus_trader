@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -129,6 +129,7 @@ XTZ: Final[Currency] = Currency.from_internal_map("XTZ")
 USDC: Final[Currency] = Currency.from_internal_map("USDC")
 USDC_POS: Final[Currency] = Currency.from_internal_map("USDC.e")
 USDP: Final[Currency] = Currency.from_internal_map("USDP")
+pUSD: Final[Currency] = Currency.from_internal_map("pUSD")
 USDT: Final[Currency] = Currency.from_internal_map("USDT")
 WSB: Final[Currency] = Currency.from_internal_map("WSB")
 XEC: Final[Currency] = Currency.from_internal_map("XEC")

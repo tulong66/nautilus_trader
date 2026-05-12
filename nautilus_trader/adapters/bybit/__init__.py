@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -24,6 +24,7 @@ subpackage's top level, so downstream code can simply import from
 ``nautilus_trader.adapters.bybit``.
 
 """
+
 from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
 from nautilus_trader.adapters.bybit.config import BybitExecClientConfig
 from nautilus_trader.adapters.bybit.constants import BYBIT
@@ -35,10 +36,13 @@ from nautilus_trader.adapters.bybit.factories import get_cached_bybit_http_clien
 from nautilus_trader.adapters.bybit.factories import get_cached_bybit_instrument_provider
 from nautilus_trader.adapters.bybit.loaders import BybitOrderBookDeltaDataLoader
 from nautilus_trader.adapters.bybit.providers import BybitInstrumentProvider
+from nautilus_trader.core.nautilus_pyo3 import BybitEnvironment
 from nautilus_trader.core.nautilus_pyo3 import BybitMarginAction
 from nautilus_trader.core.nautilus_pyo3 import BybitMarginBorrowResult
 from nautilus_trader.core.nautilus_pyo3 import BybitMarginRepayResult
 from nautilus_trader.core.nautilus_pyo3 import BybitMarginStatusResult
+from nautilus_trader.core.nautilus_pyo3 import BybitPositionIdx
+from nautilus_trader.core.nautilus_pyo3 import BybitPositionMode
 from nautilus_trader.core.nautilus_pyo3 import BybitProductType
 from nautilus_trader.core.nautilus_pyo3 import BybitTickerData
 
@@ -48,6 +52,7 @@ __all__ = [
     "BYBIT_CLIENT_ID",
     "BYBIT_VENUE",
     "BybitDataClientConfig",
+    "BybitEnvironment",
     "BybitExecClientConfig",
     "BybitInstrumentProvider",
     "BybitLiveDataClientFactory",
@@ -57,6 +62,8 @@ __all__ = [
     "BybitMarginRepayResult",
     "BybitMarginStatusResult",
     "BybitOrderBookDeltaDataLoader",
+    "BybitPositionIdx",
+    "BybitPositionMode",
     "BybitProductType",
     "BybitTickerData",
     "get_cached_bybit_http_client",

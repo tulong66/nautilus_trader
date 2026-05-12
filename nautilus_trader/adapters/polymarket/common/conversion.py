@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,14 +13,14 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from nautilus_trader.model.currencies import USDC_POS
+from nautilus_trader.model.currencies import pUSD
 from nautilus_trader.model.objects import HIGH_PRECISION
 from nautilus_trader.model.objects import Money
 
 
-def usdce_from_units(units: int) -> Money:
+def pusd_from_units(units: int) -> Money:
     """
-    Return USDC.e money from the given units amount.
+    Return pUSD money from the given units amount.
 
     Parameters
     ----------
@@ -37,4 +37,4 @@ def usdce_from_units(units: int) -> Money:
     else:
         factor = 1_000
 
-    return Money.from_raw(int(units * factor), USDC_POS)
+    return Money.from_raw(int(units * factor), pUSD)

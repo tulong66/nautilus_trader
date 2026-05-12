@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,10 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from py_clob_client.client import BalanceAllowanceParams
-from py_clob_client.client import OrderArgs
-from py_clob_client.client import PartialCreateOrderOptions
-from py_clob_client.clob_types import AssetType
+from py_clob_client_v2.client import BalanceAllowanceParams
+from py_clob_client_v2.client import OrderArgsV2
+from py_clob_client_v2.client import PartialCreateOrderOptions
+from py_clob_client_v2.clob_types import AssetType
 
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 
@@ -41,7 +41,7 @@ def place_order() -> None:
 
     # "25143473975747606484038304917293813549571262015788668262095587119656373441253"
 
-    order_args = OrderArgs(
+    order_args = OrderArgsV2(
         price=0.001,
         token_id="3642309182816755995211647069086230404892359515361325090555875625429003317932",
         size=5.004282,

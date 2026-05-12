@@ -19,14 +19,17 @@ use std::sync::{Mutex, Arc};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use nautilus_common::messages::execution::{
-    BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateOrderStatusReport, GeneratePositionReports, ModifyOrder, QueryAccount,
-    QueryOrder, SubmitOrder, SubmitOrderList,
+use nautilus_common::{
+    clients::ExecutionClient,
+    live::runner::get_exec_event_sender,
+    messages::execution::{
+        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    },
 };
 use nautilus_core::{MUTEX_POISONED, UnixNanos};
-use nautilus_execution::client::{ExecutionClient, base::ExecutionClientCore};
-use nautilus_live::execution::client::LiveExecutionClient;
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
     enums::OmsType,
@@ -86,6 +89,8 @@ pub struct LighterExecutionClient {
     core: ExecutionClientCore,
     /// Client configuration.
     config: LighterExecClientConfig,
+    /// Execution event emitter.
+    emitter: ExecutionEventEmitter,
     /// HTTP client for REST API calls (wrapped in Arc for async sharing).
     http_client: Arc<LighterRawHttpClient>,
     /// WebSocket client for real-time updates.
@@ -197,9 +202,18 @@ impl LighterExecutionClient {
             "Creating Lighter execution client"
         );
 
+        let emitter = ExecutionEventEmitter::new(
+            nautilus_core::time::get_atomic_clock_realtime(),
+            core.trader_id,
+            core.account_id,
+            core.account_type,
+            core.base_currency,
+        );
+
         Ok(Self {
             core,
             config,
+            emitter,
             http_client: Arc::new(http_client),
             ws_client,
             signer,
@@ -587,7 +601,7 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.get_account()
+        self.core.cache().account(&self.core.account_id).cloned()
     }
 
     fn generate_account_state(
@@ -597,8 +611,8 @@ impl ExecutionClient for LighterExecutionClient {
         reported: bool,
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
-        self.core
-            .generate_account_state(balances, margins, reported, ts_event)
+        self.emitter.emit_account_state(balances, margins, reported, ts_event);
+        Ok(())
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -613,6 +627,8 @@ impl ExecutionClient for LighterExecutionClient {
             "Starting Lighter execution client"
         );
 
+        self.emitter.set_sender(get_exec_event_sender());
+        self.core.set_started();
         self.started = true;
         Ok(())
     }
@@ -633,6 +649,7 @@ impl ExecutionClient for LighterExecutionClient {
             handle.abort();
         }
 
+        self.core.set_stopped();
         self.started = false;
         self.connected = false;
 
@@ -652,8 +669,13 @@ impl ExecutionClient for LighterExecutionClient {
     /// # Errors
     ///
     /// Returns an error if the client is not connected or the order is already closed.
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = &cmd.order;
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let order = self
+            .core
+            .cache()
+            .order(&cmd.client_order_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id))?;
 
         if !self.is_connected() {
             anyhow::bail!("Cannot submit order: execution client not connected");
@@ -665,12 +687,7 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         // Generate OrderSubmitted event immediately
-        self.core.generate_order_submitted(
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id(),
-            cmd.ts_init,
-        );
+        self.emitter.emit_order_submitted(&order);
 
         // Get market index from instrument
         let market_index = match self.get_market_index(&order.instrument_id()) {
@@ -680,10 +697,8 @@ impl ExecutionClient for LighterExecutionClient {
                     "Unknown instrument {}, cannot submit order",
                     order.instrument_id()
                 );
-                self.core.generate_order_rejected(
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    order.client_order_id(),
+                self.emitter.emit_order_rejected(
+                    &order,
                     "Unknown instrument",
                     cmd.ts_init,
                     false,
@@ -713,9 +728,9 @@ impl ExecutionClient for LighterExecutionClient {
         };
 
         let quantity_raw = Self::convert_quantity_to_raw(order.quantity().as_f64());
-        let is_ask = Self::order_side_to_is_ask(order);
-        let order_type = Self::convert_order_type(order);
-        let time_in_force = Self::convert_time_in_force(order);
+        let is_ask = Self::order_side_to_is_ask(&order);
+        let order_type = Self::convert_order_type(&order);
+        let time_in_force = Self::convert_time_in_force(&order);
         let reduce_only = order.is_reduce_only();
 
         // Calculate transaction expiry (default: 60 seconds from now)
@@ -753,10 +768,8 @@ impl ExecutionClient for LighterExecutionClient {
             Err(e) => {
                 error!("Failed to sign order: {}", e);
                 let reason = format!("Signing failed: {e}");
-                self.core.generate_order_rejected(
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    order.client_order_id(),
+                self.emitter.emit_order_rejected(
+                    &order,
                     &reason,
                     cmd.ts_init,
                     false,
@@ -805,16 +818,16 @@ impl ExecutionClient for LighterExecutionClient {
         Ok(())
     }
 
-    fn submit_order_list(&self, _cmd: &SubmitOrderList) -> anyhow::Result<()> {
+    fn submit_order_list(&self, _cmd: SubmitOrderList) -> anyhow::Result<()> {
         anyhow::bail!("Order lists not yet implemented for Lighter DEX")
     }
 
-    fn modify_order(&self, _cmd: &ModifyOrder) -> anyhow::Result<()> {
+    fn modify_order(&self, _cmd: ModifyOrder) -> anyhow::Result<()> {
         // TODO: Implement order modification
         anyhow::bail!("Order modification not yet implemented for Lighter DEX")
     }
 
-    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         if !self.is_connected() {
             anyhow::bail!("Cannot cancel order: not connected");
         }
@@ -847,7 +860,7 @@ impl ExecutionClient for LighterExecutionClient {
 
         // Get venue order ID (order_index)
         // cmd.venue_order_id is a VenueOrderId, try to parse it
-        let venue_order_str = cmd.venue_order_id.to_string();
+        let venue_order_str = cmd.venue_order_id.map(|id| id.to_string()).unwrap_or_default();
         let order_index = if venue_order_str.is_empty() || venue_order_str == "NULL" {
             // Fall back to cached order state
             match &order_state.venue_order_id {
@@ -904,7 +917,7 @@ impl ExecutionClient for LighterExecutionClient {
         Ok(())
     }
 
-    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         if !self.is_connected() {
             anyhow::bail!("Cannot cancel orders: not connected");
         }
@@ -952,7 +965,7 @@ impl ExecutionClient for LighterExecutionClient {
         Ok(())
     }
 
-    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         if cmd.cancels.is_empty() {
             return Ok(());
         }
@@ -969,12 +982,12 @@ impl ExecutionClient for LighterExecutionClient {
         Ok(())
     }
 
-    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
+    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
         // TODO: Implement account query
         Ok(())
     }
 
-    fn query_order(&self, _cmd: &QueryOrder) -> anyhow::Result<()> {
+    fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
         // TODO: Implement order query
         Ok(())
     }
@@ -1097,10 +1110,7 @@ impl ExecutionClient for LighterExecutionClient {
 
         Ok(())
     }
-}
 
-#[async_trait(?Send)]
-impl LiveExecutionClient for LighterExecutionClient {
     async fn generate_order_status_report(
         &self,
         _cmd: &GenerateOrderStatusReport,
@@ -1112,7 +1122,7 @@ impl LiveExecutionClient for LighterExecutionClient {
 
     async fn generate_order_status_reports(
         &self,
-        _cmd: &GenerateOrderStatusReport,
+        _cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         // TODO: Implement order status reports generation
         // 1. Query orders from HTTP API
@@ -1136,7 +1146,7 @@ impl LiveExecutionClient for LighterExecutionClient {
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionReports,
+        _cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         // TODO: Implement position status reports generation
         // 1. Query positions from HTTP API

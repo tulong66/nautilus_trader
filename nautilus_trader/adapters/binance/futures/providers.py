@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -153,12 +153,22 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
 
         # Get exchange info for all assets
         exchange_info = await self._http_market.query_futures_exchange_info()
-        account_info = await self._http_account.query_futures_account_info()
-        fee_rates = self._fee_rates[account_info.feeTier]
+
+        # Get fee tier from account info (requires authentication)
+        if self._client.api_key is None or self._client._secret is None:
+            self._log.info(
+                "API credentials not configured; using default fee tier 0",
+            )
+            fee_rates = self._fee_rates[0]
+        else:
+            account_info = await self._http_account.query_futures_account_info()
+            fee_rates = self._fee_rates[account_info.feeTier]
 
         if (
             isinstance(self._config, BinanceInstrumentProviderConfig)
             and self._config.query_commission_rates
+            and self._client.api_key is not None
+            and self._client._secret is not None
         ):
             self._log.info("Querying commission rates per symbol (parallel requests)")
 
@@ -220,15 +230,22 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
         symbol_info_dict: dict[str, BinanceFuturesSymbolInfo] = {
             info.symbol: info for info in exchange_info.symbols
         }
-        account_info = await self._http_account.query_futures_account_info()
-        fee_rates = self._fee_rates[account_info.feeTier]
 
-        position_risk_resp = await self._http_account.query_futures_position_risk()
-        position_risk = {risk.symbol: risk for risk in position_risk_resp}
+        # Get fee tier and position risk (requires authentication)
+        if self._client.api_key is None or self._client._secret is None:
+            fee_rates = self._fee_rates[0]
+            position_risk = {}
+        else:
+            account_info = await self._http_account.query_futures_account_info()
+            fee_rates = self._fee_rates[account_info.feeTier]
+            position_risk_resp = await self._http_account.query_futures_position_risk()
+            position_risk = {risk.symbol: risk for risk in position_risk_resp}
 
         if (
             isinstance(self._config, BinanceInstrumentProviderConfig)
             and self._config.query_commission_rates
+            and self._client.api_key is not None
+            and self._client._secret is not None
         ):
 
             async def _query_fee(symbol: str) -> BinanceFuturesCommissionRate:
@@ -283,12 +300,18 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
             info.symbol: info for info in exchange_info.symbols
         }
 
-        account_info = await self._http_account.query_futures_account_info()
-        fee_rates = self._fee_rates[account_info.feeTier]
+        # Get fee tier from account info (requires authentication)
+        if self._client.api_key is None or self._client._secret is None:
+            fee_rates = self._fee_rates[0]
+        else:
+            account_info = await self._http_account.query_futures_account_info()
+            fee_rates = self._fee_rates[account_info.feeTier]
 
         if (
             isinstance(self._config, BinanceInstrumentProviderConfig)
             and self._config.query_commission_rates
+            and self._client.api_key is not None
+            and self._client._secret is not None
         ):
             try:
                 fee = await self._http_wallet.query_futures_commission_rate(symbol=symbol)
@@ -365,6 +388,7 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
             max_quantity = Quantity(float(lot_size_filter.maxQty), precision=size_precision)
             min_quantity = Quantity(float(lot_size_filter.minQty), precision=size_precision)
             min_notional = None
+
             if filters.get(BinanceSymbolFilterType.MIN_NOTIONAL):
                 min_notional = Money(min_notional_filter.notional, currency=quote_currency)
             max_notional = (
@@ -378,6 +402,7 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
             # Futures commissions
             maker_fee = Decimal(0)
             taker_fee = Decimal(0)
+
             if fee:
                 assert fee.symbol == symbol_info.symbol
                 maker_fee = Decimal(fee.makerCommissionRate)
@@ -391,7 +416,11 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
                 raise ValueError(f"Unrecognized margin asset {symbol_info.marginAsset}")
 
             contract_type = BinanceFuturesContractType(contract_type_str)
-            if contract_type == BinanceFuturesContractType.PERPETUAL:
+            if contract_type in (
+                BinanceFuturesContractType.PERPETUAL,
+                BinanceFuturesContractType.PERPETUAL_DELIVERING,
+                BinanceFuturesContractType.TRADIFI_PERPETUAL,
+            ):
                 instrument = CryptoPerpetual(
                     instrument_id=instrument_id,
                     raw_symbol=raw_symbol,
@@ -409,8 +438,8 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
                     min_notional=min_notional,
                     max_price=max_price,
                     min_price=min_price,
-                    margin_init=Decimal(symbol_info.requiredMarginPercent) / 100,
-                    margin_maint=Decimal(symbol_info.maintMarginPercent) / 100,
+                    margin_init=Decimal(1),  # Binance docs: ignore API values
+                    margin_maint=Decimal(1),  # Binance docs: ignore API values
                     maker_fee=maker_fee,
                     taker_fee=taker_fee,
                     ts_event=ts_event,
@@ -444,8 +473,8 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
                     min_notional=min_notional,
                     max_price=max_price,
                     min_price=min_price,
-                    margin_init=Decimal(symbol_info.requiredMarginPercent) / 100,
-                    margin_maint=Decimal(symbol_info.maintMarginPercent) / 100,
+                    margin_init=Decimal(1),  # Binance docs: ignore API values
+                    margin_maint=Decimal(1),  # Binance docs: ignore API values
                     maker_fee=maker_fee,
                     taker_fee=taker_fee,
                     ts_event=ts_event,

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,94 +15,135 @@
 
 //! Example binary demonstrating Deribit WebSocket data streaming.
 //!
-//! This example connects to the Deribit testnet WebSocket API,
-//! subscribes to trade data for BTC-PERPETUAL, and prints received trade ticks.
+//! This example connects to the Deribit WebSocket API and subscribes to trade data.
+//! Supports both aggregated (100ms) and raw data streams.
 //!
 //! # Environment Variables
 //!
-//! For authenticated streams (optional):
+//! For raw streams (required):
 //! - `DERIBIT_TESTNET_API_KEY`: Your Deribit testnet API key
 //! - `DERIBIT_TESTNET_API_SECRET`: Your Deribit testnet API secret
+//!
+//! For mainnet raw streams:
+//! - `DERIBIT_API_KEY`: Your Deribit mainnet API key
+//! - `DERIBIT_API_SECRET`: Your Deribit mainnet API secret
 //!
 //! # Usage
 //!
 //! ```bash
-//! cargo run --bin ws_data
+//! # Aggregated 100ms streams (no auth required)
+//! cargo run -p nautilus-deribit --bin deribit-ws-data
+//!
+//! # Raw streams (requires auth)
+//! cargo run -p nautilus-deribit --bin deribit-ws-data -- --raw --testnet
 //! ```
 
 use std::env;
 
 use futures_util::StreamExt;
 use nautilus_deribit::{
+    common::enums::DeribitEnvironment,
     http::{client::DeribitHttpClient, models::DeribitCurrency},
-    websocket::client::DeribitWebSocketClient,
+    websocket::{
+        auth::DERIBIT_DATA_SESSION_NAME, client::DeribitWebSocketClient,
+        enums::DeribitUpdateInterval,
+    },
 };
 use nautilus_model::identifiers::InstrumentId;
 use tokio::{pin, signal};
-use tracing::level_filters::LevelFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::DEBUG)
-        .init();
-    let args: Vec<String> = env::args().collect();
-    let is_testnet = args.iter().any(|a| a == "--testnet");
+    nautilus_common::logging::ensure_logging_initialized();
 
-    tracing::info!(
-        "Starting Deribit WebSocket data example ({})",
-        if is_testnet { "testnet" } else { "mainnet" }
+    let args: Vec<String> = env::args().collect();
+    let environment = if args.iter().any(|a| a == "--testnet") {
+        DeribitEnvironment::Testnet
+    } else {
+        DeribitEnvironment::Mainnet
+    };
+    let use_raw = args.iter().any(|a| a == "--raw");
+
+    log::info!(
+        "Starting Deribit WebSocket data example ({environment}, {})",
+        if use_raw { "raw" } else { "100ms" }
     );
 
     // Fetch instruments via HTTP to get proper instrument metadata
     let http_client = DeribitHttpClient::new(
-        None, // base_url
-        is_testnet, None, // timeout_secs
-        None, // max_retries
-        None, // retry_delay_ms
-        None, // retry_delay_max_ms
-        None, // proxy_url
+        None,        // base_url
+        environment, // environment
+        10,          // timeout_secs
+        3,           // max_retries
+        1000,        // retry_delay_ms
+        10_000,      // retry_delay_max_ms
+        None,        // proxy_url
     )?;
-    tracing::info!("Fetching BTC instruments from Deribit...");
+    log::info!("Fetching BTC instruments from Deribit...");
     let instruments = http_client
         .request_instruments(DeribitCurrency::BTC, None)
         .await?;
-    tracing::info!("Fetched {} instruments", instruments.len());
+    log::info!("Fetched {} instruments", instruments.len());
 
-    // Create WebSocket client for public data (no auth required for market data)
-    // Must match HTTP client's is_testnet setting for instrument consistency
-    let mut ws_client = DeribitWebSocketClient::new_public(is_testnet)?;
-    ws_client.cache_instruments(instruments);
-    tracing::info!("Connecting to Deribit WebSocket...");
+    // Create WebSocket client based on whether raw streams are requested
+    let mut ws_client = if use_raw {
+        log::info!("Creating authenticated client for raw streams");
+        DeribitWebSocketClient::with_credentials(environment, None)?
+    } else {
+        log::info!("Creating public client for 100ms streams");
+        DeribitWebSocketClient::new_public(environment, None)?
+    };
+
+    ws_client.cache_instruments(&instruments);
+    log::info!("Connecting to Deribit WebSocket...");
     ws_client.connect().await?;
-    tracing::info!("Connected to Deribit WebSocket");
+    log::info!("Connected to Deribit WebSocket");
+
+    // Authenticate if using raw streams
+    if use_raw {
+        log::info!("Authenticating WebSocket connection for raw streams...");
+        ws_client
+            .authenticate_session(DERIBIT_DATA_SESSION_NAME)
+            .await?;
+        log::info!("Authentication successful");
+    }
+
+    // Set interval based on mode
+    let interval = if use_raw {
+        Some(DeribitUpdateInterval::Raw)
+    } else {
+        None // Uses default 100ms
+    };
 
     // Subscribe to trades for BTC-PERPETUAL
     let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
-    tracing::info!("Subscribing to trades for {instrument_id}");
-    ws_client.subscribe_trades(instrument_id).await?;
+    log::info!(
+        "Subscribing to trades for {instrument_id} (interval: {})",
+        interval.map_or("100ms", |i| i.as_str())
+    );
+    ws_client.subscribe_trades(instrument_id, interval).await?;
 
     // Optional: Subscribe to other data types
-    // ws_client.subscribe_book(instrument_id).await?;
-    // ws_client.subscribe_ticker(instrument_id).await?;
+    // ws_client.subscribe_book(instrument_id, interval).await?;
+    // ws_client.subscribe_ticker(instrument_id, interval).await?;
     // ws_client.subscribe_quotes(instrument_id).await?;
 
     // Create a future that completes on CTRL+C
     let sigint = signal::ctrl_c();
     pin!(sigint);
 
-    let stream = ws_client.stream();
+    let stream = ws_client.stream()?;
     tokio::pin!(stream);
 
-    tracing::info!("Listening for market data... Press Ctrl+C to exit");
+    log::info!("Listening for market data... Press Ctrl+C to exit");
 
     loop {
         tokio::select! {
             Some(msg) = stream.next() => {
-                tracing::info!("{msg:?}");
+                log::info!("{msg:?}");
             }
             _ = &mut sigint => {
-                tracing::info!("Received SIGINT, closing connection...");
+                log::info!("Received SIGINT, closing connection...");
                 ws_client.close().await?;
                 break;
             }
@@ -110,6 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tracing::info!("Deribit WebSocket example finished");
+    log::info!("Deribit WebSocket example finished");
     Ok(())
 }

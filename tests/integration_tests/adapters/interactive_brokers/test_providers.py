@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -19,6 +19,13 @@ import pytest
 from ibapi.contract import ContractDetails
 
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
+from nautilus_trader.adapters.interactive_brokers.common import IBContractDetails
+from nautilus_trader.adapters.interactive_brokers.config import (
+    InteractiveBrokersInstrumentProviderConfig,
+)
+from nautilus_trader.adapters.interactive_brokers.providers import (
+    InteractiveBrokersInstrumentProvider,
+)
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import InstrumentClass
 from nautilus_trader.model.enums import OptionKind
@@ -89,7 +96,8 @@ async def test_load_futures_contract_instrument(mocker, instrument_provider):
 @pytest.mark.asyncio
 async def test_load_option_contract_instrument(mocker, instrument_provider):
     # Arrange
-    instrument_id = InstrumentId.from_str("TSLA230120C00100000.MIAX")
+    # OCC format preserves space padding between symbol and expiry
+    instrument_id = InstrumentId.from_str("TSLA  230120C00100000.MIAX")
     mock_ib_contract_calls(
         mocker=mocker,
         instrument_provider=instrument_provider,
@@ -98,7 +106,7 @@ async def test_load_option_contract_instrument(mocker, instrument_provider):
 
     # Act
     await instrument_provider.load_async(
-        IBContract(secType="OPT", symbol="TSLA230120C00100000", exchange="MIAX"),
+        IBContract(secType="OPT", symbol="TSLA  230120C00100000", exchange="MIAX"),
     )
     option = instrument_provider.find(instrument_id)
     instrument_provider._client.stop()
@@ -107,7 +115,7 @@ async def test_load_option_contract_instrument(mocker, instrument_provider):
     assert option.id == instrument_id
     assert option.asset_class == AssetClass.EQUITY
     assert option.multiplier == 100
-    assert option.expiration_ns == 1674172800000000000
+    assert option.expiration_ns == 1674248400000000000
     assert option.strike_price == Price.from_str("100.0")
     assert option.option_kind == OptionKind.CALL
     assert option.price_increment == Price.from_str("0.01")
@@ -227,3 +235,266 @@ async def test_bag_contract_venue_determination(instrument_provider):
     # Assert
     assert venue_smart == "CME"  # Should use primaryExchange when exchange is SMART
     assert venue_direct == "ARCA"  # Should use exchange directly
+
+
+@pytest.mark.asyncio
+async def test_determine_venue_from_contract_opt_smart_uses_symbol_to_mic_venue(ib_client):
+    """
+    When _symbol_to_mic_venue is configured, OPT contract with exchange SMART returns
+    the symbol-specific MIC venue (e.g. SPX -> XCBO).
+    """
+    from nautilus_trader.common.component import LiveClock
+
+    config = InteractiveBrokersInstrumentProviderConfig(
+        symbol_to_mic_venue={"SPX": "XCBO"},
+    )
+    provider = InteractiveBrokersInstrumentProvider(
+        client=ib_client,
+        clock=LiveClock(),
+        config=config,
+    )
+    contract = IBContract(
+        secType="OPT",
+        symbol="SPX",
+        exchange="SMART",
+        localSymbol="SPXW  260120P06835000",
+        currency="USD",
+    )
+    venue = provider.determine_venue_from_contract(contract)
+    assert venue == "XCBO"
+
+
+@pytest.mark.asyncio
+async def test_determine_venue_from_contract_opt_smart_uses_first_non_smart_from_details(
+    instrument_provider,
+):
+    """
+    When OPT has exchange SMART and no primaryExchange, passing contract_details with
+    validExchanges (e.g. SMART,CBOE) yields first non-SMART as exchange, then venue CBOE
+    when convert_exchange_to_mic_venue is False.
+    """
+    contract = IBContract(
+        secType="OPT",
+        symbol="SPX",
+        exchange="SMART",
+        localSymbol="SPXW  260120P06835000",
+        currency="USD",
+    )
+    details = IBContractDetails(
+        contract=contract,
+        validExchanges="SMART,CBOE",
+        minTick=0.01,
+    )
+    venue = instrument_provider.determine_venue_from_contract(
+        contract,
+        contract_details=details,
+    )
+    assert venue == "CBOE"
+
+
+@pytest.mark.asyncio
+async def test_determine_venue_from_contract_opt_smart_maps_to_mic_when_convert_enabled(
+    ib_client,
+):
+    """
+    When convert_exchange_to_mic_venue is True and OPT SMART gets exchange from
+    validExchanges (first non-SMART), venue is mapped to MIC via VENUE_MEMBERS (e.g.
+    CBOE -> XCBO).
+    """
+    from nautilus_trader.common.component import LiveClock
+
+    config = InteractiveBrokersInstrumentProviderConfig(
+        convert_exchange_to_mic_venue=True,
+    )
+    provider = InteractiveBrokersInstrumentProvider(
+        client=ib_client,
+        clock=LiveClock(),
+        config=config,
+    )
+    contract = IBContract(
+        secType="OPT",
+        symbol="SPX",
+        exchange="SMART",
+        localSymbol="SPXW  260120P06835000",
+        currency="USD",
+    )
+    details = IBContractDetails(
+        contract=contract,
+        validExchanges="SMART,CBOE",
+        minTick=0.01,
+    )
+    venue = provider.determine_venue_from_contract(
+        contract,
+        contract_details=details,
+    )
+    assert venue == "XCBO"
+
+
+def test_process_contract_details_resolves_venue_per_detail_when_not_provided(ib_client):
+    from nautilus_trader.common.component import LiveClock
+
+    provider = InteractiveBrokersInstrumentProvider(
+        client=ib_client,
+        clock=LiveClock(),
+        config=InteractiveBrokersInstrumentProviderConfig(
+            convert_exchange_to_mic_venue=True,
+        ),
+    )
+
+    processed_ids = provider._process_contract_details(
+        [
+            IBTestContractStubs.aapl_equity_contract_details(),
+            IBTestContractStubs.cl_future_contract_details(),
+        ],
+    )
+
+    assert processed_ids == [
+        InstrumentId.from_str("AAPL.XNAS"),
+        InstrumentId.from_str("CLZ3.XNYM"),
+    ]
+
+
+def test_process_contract_details_uses_explicit_venue_when_provided(ib_client):
+    """
+    When venue is passed, that venue is used for all details (no per-detail resolution).
+    """
+    from nautilus_trader.common.component import LiveClock
+
+    provider = InteractiveBrokersInstrumentProvider(
+        client=ib_client,
+        clock=LiveClock(),
+        config=InteractiveBrokersInstrumentProviderConfig(
+            convert_exchange_to_mic_venue=True,
+        ),
+    )
+
+    processed_ids = provider._process_contract_details(
+        [
+            IBTestContractStubs.aapl_equity_contract_details(),
+            IBTestContractStubs.cl_future_contract_details(),
+        ],
+        venue="XNAS",
+    )
+
+    assert processed_ids == [
+        InstrumentId.from_str("AAPL.XNAS"),
+        InstrumentId.from_str("CLZ3.XNAS"),
+    ]
+
+
+def test_determine_venue_from_contract_symbol_to_mic_venue_without_convert_exchange(ib_client):
+    """
+    symbol_to_mic_venue is applied regardless of convert_exchange_to_mic_venue.
+    """
+    from nautilus_trader.common.component import LiveClock
+
+    config = InteractiveBrokersInstrumentProviderConfig(
+        symbol_to_mic_venue={"SPX": "XCBO"},
+        convert_exchange_to_mic_venue=False,
+    )
+    provider = InteractiveBrokersInstrumentProvider(
+        client=ib_client,
+        clock=LiveClock(),
+        config=config,
+    )
+    contract = IBContract(
+        secType="OPT",
+        symbol="SPX",
+        exchange="SMART",
+        localSymbol="SPXW  260120P06835000",
+        currency="USD",
+    )
+    venue = provider.determine_venue_from_contract(contract)
+    assert venue == "XCBO"
+
+
+@pytest.mark.asyncio
+async def test_create_bag_contract_with_explicit_exchange(instrument_provider):
+    """
+    Test that _create_bag_contract uses explicit exchange parameter when provided.
+    """
+    from nautilus_trader.adapters.interactive_brokers.common import IBContractDetails
+
+    # Arrange - Create mock leg contract details
+    leg1_contract = IBContract(
+        secType="FUT",
+        symbol="ES",
+        conId=100,
+        exchange="CME",
+        currency="USD",
+        multiplier="50",
+    )
+    leg1_details = IBContractDetails(contract=leg1_contract, minTick=0.25, underSymbol="ES")
+
+    leg2_contract = IBContract(
+        secType="FUT",
+        symbol="ES",
+        conId=101,
+        exchange="CME",
+        currency="USD",
+        multiplier="50",
+    )
+    leg2_details = IBContractDetails(contract=leg2_contract, minTick=0.25, underSymbol="ES")
+
+    leg_contract_details = [(leg1_details, 1), (leg2_details, -1)]
+    instrument_id = None
+
+    # Act - Create BAG contract with explicit exchange
+    bag_contract = await instrument_provider._create_bag_contract(
+        leg_contract_details=leg_contract_details,
+        instrument_id=instrument_id,
+        exchange="CME",  # Explicit exchange
+    )
+
+    # Assert
+    assert bag_contract.exchange == "CME"
+    assert bag_contract.secType == "BAG"
+    assert bag_contract.symbol == "ES"
+    assert bag_contract.currency == "USD"
+    assert len(bag_contract.comboLegs) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_bag_contract_defaults_to_smart(instrument_provider):
+    """
+    Test that _create_bag_contract defaults to SMART exchange when not provided.
+    """
+    from nautilus_trader.adapters.interactive_brokers.common import IBContractDetails
+
+    # Arrange - Create mock leg contract details
+    leg1_contract = IBContract(
+        secType="FUT",
+        symbol="ES",
+        conId=100,
+        exchange="CME",
+        currency="USD",
+        multiplier="50",
+    )
+    leg1_details = IBContractDetails(contract=leg1_contract, minTick=0.25, underSymbol="ES")
+
+    leg2_contract = IBContract(
+        secType="FUT",
+        symbol="ES",
+        conId=101,
+        exchange="CME",
+        currency="USD",
+        multiplier="50",
+    )
+    leg2_details = IBContractDetails(contract=leg2_contract, minTick=0.25, underSymbol="ES")
+
+    leg_contract_details = [(leg1_details, 1), (leg2_details, -1)]
+    instrument_id = None
+
+    # Act - Create BAG contract without exchange (empty string should default to SMART)
+    bag_contract = await instrument_provider._create_bag_contract(
+        leg_contract_details=leg_contract_details,
+        instrument_id=instrument_id,
+        exchange="",  # Empty string should default to SMART
+    )
+
+    # Assert
+    assert bag_contract.exchange == "SMART"
+    assert bag_contract.secType == "BAG"
+    assert bag_contract.symbol == "ES"
+    assert bag_contract.currency == "USD"
+    assert len(bag_contract.comboLegs) == 2
