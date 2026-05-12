@@ -102,8 +102,8 @@ pub struct LighterExecutionClient {
     /// Cached instruments (InstrumentId -> InstrumentAny).
     #[allow(dead_code)] // Will be used for instrument lookups and price/size conversions
     instruments: DashMap<InstrumentId, InstrumentAny>,
-    /// Market symbol to InstrumentId mapping.
-    market_to_instrument: DashMap<String, InstrumentId>,
+    /// InstrumentId to Lighter market index mapping.
+    instrument_to_market_index: DashMap<InstrumentId, u16>,
     /// Order state cache (ClientOrderId -> OrderState).
     orders: DashMap<ClientOrderId, OrderState>,
     /// Client started flag.
@@ -219,7 +219,7 @@ impl LighterExecutionClient {
             signer,
             nonce_manager,
             instruments: DashMap::new(),
-            market_to_instrument: DashMap::new(),
+            instrument_to_market_index: DashMap::new(),
             orders: DashMap::new(),
             started: false,
             connected: false,
@@ -266,34 +266,28 @@ impl LighterExecutionClient {
     /// Cache instruments for lookups.
     #[allow(dead_code)] // Will be used for instrument initialization from HTTP API
     fn cache_instruments(&mut self, instruments: Vec<InstrumentAny>) {
-        for instrument in instruments {
+        for (market_index, instrument) in instruments.into_iter().enumerate() {
             let instrument_id = instrument.id();
-            let symbol = instrument_id.symbol.as_str();
 
             self.instruments.insert(instrument_id, instrument.clone());
-            self.market_to_instrument
-                .insert(symbol.to_string(), instrument_id);
+            self.instrument_to_market_index
+                .insert(instrument_id, u16::try_from(market_index).unwrap_or(u16::MAX));
         }
 
         self.instruments_initialized = true;
         info!("Cached {} instruments", self.instruments.len());
     }
 
-    /// Get market index from instrument symbol.
-    ///
-    /// The market index is extracted from the cached instrument data.
-    /// Returns None if the instrument is not found.
+    fn market_index_from_cache(
+        cache: &DashMap<InstrumentId, u16>,
+        instrument_id: &InstrumentId,
+    ) -> Option<u16> {
+        cache.get(instrument_id).map(|entry| *entry)
+    }
+
+    /// Get market index from cached exchange metadata.
     fn get_market_index(&self, instrument_id: &InstrumentId) -> Option<u16> {
-        // For now, use a simple symbol-to-index mapping
-        // In production, this would be populated from the exchange API
-        let symbol = instrument_id.symbol.as_str();
-        match symbol {
-            s if s.contains("ETH") => Some(1),
-            s if s.contains("BTC") => Some(2),
-            s if s.contains("SOL") => Some(3),
-            s if s.contains("DOGE") => Some(4),
-            _ => None,
-        }
+        Self::market_index_from_cache(&self.instrument_to_market_index, instrument_id)
     }
 
     /// Convert NautilusTrader order side to Lighter is_ask flag.
@@ -1021,8 +1015,8 @@ impl ExecutionClient for LighterExecutionClient {
                 nautilus_model::identifiers::Symbol::new(&symbol),
                 *LIGHTER_VENUE,
             );
-            self.market_to_instrument
-                .insert(symbol, instrument_id);
+            self.instrument_to_market_index
+                .insert(instrument_id, market.market_index);
             debug!(
                 "Cached market {} -> instrument {}",
                 market.market_index, instrument_id
@@ -1171,9 +1165,29 @@ impl ExecutionClient for LighterExecutionClient {
 
 #[cfg(test)]
 mod tests {
+    use dashmap::DashMap;
+    use nautilus_model::identifiers::InstrumentId;
+
+    use super::*;
+
     #[test]
     fn test_client_creation() {
         // This test would need a valid private key and core setup
         // Placeholder for future implementation
+    }
+
+    #[test]
+    fn market_index_lookup_uses_cache_not_symbol_heuristics() {
+        let cache = DashMap::new();
+        let eth = InstrumentId::from("ETH_USDC.LIGHTER");
+        let btc = InstrumentId::from("BTC_USDC.LIGHTER");
+        let unknown = InstrumentId::from("UNKNOWN_USDC.LIGHTER");
+
+        cache.insert(eth, 42);
+        cache.insert(btc, 7);
+
+        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &eth), Some(42));
+        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &btc), Some(7));
+        assert_eq!(LighterExecutionClient::market_index_from_cache(&cache, &unknown), None);
     }
 }

@@ -149,6 +149,16 @@ impl LighterSigner {
     /// Transaction type: Cancel all orders.
     pub const TX_TYPE_CANCEL_ALL_ORDERS: u8 = 16;
 
+    #[must_use]
+    pub const fn strategy_signing_surface() -> [&'static str; 4] {
+        [
+            "create_auth_token",
+            "sign_create_order",
+            "sign_cancel_order",
+            "sign_cancel_all_orders",
+        ]
+    }
+
     /// Create a new signer with pure Rust implementation.
     ///
     /// # Arguments
