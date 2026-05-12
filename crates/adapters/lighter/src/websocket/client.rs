@@ -157,6 +157,13 @@ impl LighterWebSocketClient {
         }
     }
 
+    fn resubscribe_messages(channels: &[String]) -> Vec<OutboundMessage> {
+        channels
+            .iter()
+            .map(OutboundMessage::subscribe)
+            .collect()
+    }
+
     /// Connect to the WebSocket endpoint.
     ///
     /// # Errors
@@ -247,8 +254,7 @@ impl LighterWebSocketClient {
 
                     // Resubscribe to previous subscriptions (one by one)
                     let subs = subscriptions.read().await.clone();
-                    for channel in &subs {
-                        let sub_msg = OutboundMessage::subscribe(channel);
+                    for (channel, sub_msg) in subs.iter().zip(Self::resubscribe_messages(&subs)) {
                         if let Ok(json) = sub_msg.to_json() {
                             if let Err(e) = write.send(Message::Text(json.into())).await {
                                 error!("Failed to resubscribe to {}: {}", channel, e);
@@ -632,5 +638,26 @@ mod tests {
         // Should fail when not connected
         let result = client.subscribe(subs).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resubscribe_messages_preserve_channels() {
+        let channels = vec![
+            "order_book/1".to_string(),
+            "trade/1".to_string(),
+            "market_stats/1".to_string(),
+        ];
+
+        let messages = LighterWebSocketClient::resubscribe_messages(&channels);
+        let json: Vec<String> = messages
+            .iter()
+            .map(OutboundMessage::to_json)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert!(json[0].contains("order_book/1"));
+        assert!(json[1].contains("trade/1"));
+        assert!(json[2].contains("market_stats/1"));
     }
 }

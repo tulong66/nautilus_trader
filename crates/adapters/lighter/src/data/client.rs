@@ -34,6 +34,7 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::InstrumentAny,
 };
+use serde::Deserialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -41,6 +42,7 @@ use ustr::Ustr;
 use crate::{
     common::{MarketInfo, consts::LIGHTER_VENUE},
     config::LighterDataClientConfig,
+    data::types::DEFAULT_SIZE_DECIMALS,
     error::LighterError,
     http::LighterRawHttpClient,
     websocket::LighterWebSocketClient,
@@ -64,6 +66,62 @@ enum SubscriptionState {
     Trades { market_index: u16 },
     /// Ticker subscription with market index.
     Ticker { market_index: u16 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandleStick {
+    timestamp: i64,
+    open: String,
+    high: String,
+    low: String,
+    close: String,
+    volume: String,
+}
+
+fn bar_type_to_lighter_interval(bar_type: BarType) -> Result<&'static str, LighterError> {
+    use nautilus_model::enums::BarAggregation;
+
+    let spec = bar_type.spec();
+    match (spec.step.get(), spec.aggregation) {
+        (1, BarAggregation::Minute) => Ok("1m"),
+        (5, BarAggregation::Minute) => Ok("5m"),
+        (15, BarAggregation::Minute) => Ok("15m"),
+        (1, BarAggregation::Hour) => Ok("1h"),
+        (4, BarAggregation::Hour) => Ok("4h"),
+        (1, BarAggregation::Day) => Ok("1d"),
+        _ => Err(LighterError::Internal(format!(
+            "Unsupported bar specification: {:?}",
+            spec
+        ))),
+    }
+}
+
+fn parse_candlestick_bar(
+    candle: &CandleStick,
+    bar_type: BarType,
+    price_decimals: u8,
+    size_decimals: u8,
+) -> Result<Bar, LighterError> {
+    use crate::data::types::{parse_bar, parse_decimal_to_raw};
+
+    let open = parse_decimal_to_raw(&candle.open, price_decimals, "open")?;
+    let high = parse_decimal_to_raw(&candle.high, price_decimals, "high")?;
+    let low = parse_decimal_to_raw(&candle.low, price_decimals, "low")?;
+    let close = parse_decimal_to_raw(&candle.close, price_decimals, "close")?;
+    let volume = parse_decimal_to_raw(&candle.volume, size_decimals, "volume")?;
+    let timestamp_ns = u64::try_from(candle.timestamp)
+        .map_err(|_| LighterError::Parse(format!("Invalid candle timestamp {}", candle.timestamp)))?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| LighterError::Parse(format!("Candle timestamp overflow: {}", candle.timestamp)))?;
+
+    parse_bar(open, high, low, close, volume, bar_type, price_decimals, size_decimals, timestamp_ns)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MarketPrecision {
+    price_decimals: u8,
+    size_decimals: u8,
 }
 
 /// Lighter DEX data client.
@@ -107,8 +165,8 @@ pub struct LighterDataClient {
     instrument_to_market_index: Arc<RwLock<AHashMap<InstrumentId, u16>>>,
     /// market_index to InstrumentId reverse mapping (for WebSocket message routing)
     market_index_to_instrument: Arc<RwLock<AHashMap<u16, InstrumentId>>>,
-    /// market_index to price_decimals mapping (for proper price conversion)
-    market_price_decimals: Arc<RwLock<AHashMap<u16, u8>>>,
+    /// market_index to price/size precision mapping.
+    market_precisions: Arc<RwLock<AHashMap<u16, MarketPrecision>>>,
     /// Active subscriptions (InstrumentId -> SubscriptionState).
     subscriptions: Arc<RwLock<AHashMap<InstrumentId, SubscriptionState>>>,
     /// Real-time clock for timestamps (used in data event generation).
@@ -154,7 +212,7 @@ impl LighterDataClient {
             symbol_to_instrument_id: Arc::new(RwLock::new(AHashMap::new())),
             instrument_to_market_index: Arc::new(RwLock::new(AHashMap::new())),
             market_index_to_instrument: Arc::new(RwLock::new(AHashMap::new())),
-            market_price_decimals: Arc::new(RwLock::new(AHashMap::new())),
+            market_precisions: Arc::new(RwLock::new(AHashMap::new())),
             subscriptions: Arc::new(RwLock::new(AHashMap::new())),
             clock,
         })
@@ -421,19 +479,7 @@ impl LighterDataClient {
         // Get market index
         let market_index = self.get_market_index_for_instrument(&instrument_id)?;
 
-        // Convert bar aggregation to interval string
-        use nautilus_model::enums::BarAggregation;
-        let interval = match bar_type.spec().aggregation {
-            BarAggregation::Minute => "1m",
-            BarAggregation::Hour => "1h",
-            BarAggregation::Day => "1d",
-            _ => {
-                return Err(LighterError::Internal(format!(
-                    "Unsupported bar aggregation: {:?}",
-                    bar_type.spec().aggregation
-                )));
-            }
-        };
+        let interval = bar_type_to_lighter_interval(bar_type)?;
 
         // Build query parameters
         let mut params = vec![
@@ -453,20 +499,7 @@ impl LighterDataClient {
 
         // Make HTTP request
         use crate::http::endpoints::CANDLESTICKS;
-        use crate::http::types::{LighterResponse, LighterList};
-        use serde::{Deserialize};
-
-        #[derive(Debug, Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        #[allow(dead_code)] // Fields used for deserialization, bar conversion TODO
-        struct CandleStick {
-            timestamp: i64,
-            open: String,
-            high: String,
-            low: String,
-            close: String,
-            volume: String,
-        }
+        use crate::http::types::{LighterList, LighterResponse};
 
         let response: LighterResponse<LighterList<CandleStick>> =
             self.http_client.get(CANDLESTICKS, Some(&query_string)).await?;
@@ -475,27 +508,25 @@ impl LighterDataClient {
             .data
             .ok_or_else(|| LighterError::Parse("No candle data in response".to_string()))?
             .items;
+        let precision = self
+            .market_precisions
+            .read()
+            .unwrap()
+            .get(&market_index)
+            .copied()
+            .unwrap_or(MarketPrecision {
+                price_decimals: 2,
+                size_decimals: DEFAULT_SIZE_DECIMALS,
+            });
 
-        // Convert to Bar objects
-        // Note: We need price_decimals from market info for proper conversion
-        // For now, we'll use default parsing which may need adjustment
-        let bars = Vec::new();
-        for _candle in candles {
-            // Parse prices and volume
-            // let _open = candle.open.parse::<f64>()
-            //     .map_err(|e| LighterError::Parse(format!("Failed to parse open price: {}", e)))?;
-            // let _high = candle.high.parse::<f64>()
-            //     .map_err(|e| LighterError::Parse(format!("Failed to parse high price: {}", e)))?;
-            // let _low = candle.low.parse::<f64>()
-            //     .map_err(|e| LighterError::Parse(format!("Failed to parse low price: {}", e)))?;
-            // let _close = candle.close.parse::<f64>()
-            //     .map_err(|e| LighterError::Parse(format!("Failed to parse close price: {}", e)))?;
-            // let _volume = candle.volume.parse::<f64>()
-            //     .map_err(|e| LighterError::Parse(format!("Failed to parse volume: {}", e)))?;
-
-            // This is a simplified implementation - proper implementation should use
-            // the parse_bar function from data/types.rs with correct price_decimals
-            tracing::warn!("Bar conversion not fully implemented - using simplified price parsing");
+        let mut bars = Vec::with_capacity(candles.len());
+        for candle in candles {
+            bars.push(parse_candlestick_bar(
+                &candle,
+                bar_type,
+                precision.price_decimals,
+                precision.size_decimals,
+            )?);
         }
 
         tracing::info!("Fetched {} bars for {}", bars.len(), instrument_id);
@@ -532,14 +563,18 @@ impl LighterDataClient {
                 format!("{}.{}", market.symbol, *LIGHTER_VENUE).as_str()
             );
 
+            use crate::data::types::decimal_places;
+            let price_decimals = decimal_places(&market.tick_size, "tick_size")?;
+            let size_decimals = decimal_places(&market.step_size, "step_size")?;
+
             // Create MarketInfo
             let market_info = MarketInfo {
                 market_id: market.market_index as u32,
                 symbol: market.symbol.to_string(),
                 base_symbol: market.base_asset.to_string(),
                 quote_symbol: market.quote_asset.to_string(),
-                price_decimals: 2, // Default, should be obtained from API if available
-                size_decimals: 8,  // Default, should be obtained from API if available
+                price_decimals,
+                size_decimals,
                 min_base_amount: market.min_order_size.parse::<f64>()
                     .unwrap_or(0.0)
                     .to_bits(),
@@ -584,10 +619,13 @@ impl LighterDataClient {
                         instrument_id,
                     );
 
-                    // Store price decimals for this market
-                    self.market_price_decimals.write().unwrap().insert(
+                    // Store price/size precision for this market
+                    self.market_precisions.write().unwrap().insert(
                         market.market_index,
-                        market_info.price_decimals,
+                        MarketPrecision {
+                            price_decimals: market_info.price_decimals,
+                            size_decimals: market_info.size_decimals,
+                        },
                     );
                 },
                 Err(e) => {
@@ -652,7 +690,7 @@ impl LighterDataClient {
 
         // Clone Arc references for the spawned task
         let market_index_to_instrument = Arc::clone(&self.market_index_to_instrument);
-        let market_price_decimals = Arc::clone(&self.market_price_decimals);
+        let market_precisions = Arc::clone(&self.market_precisions);
         let data_sender = self.data_sender.clone();
 
         let handle = tokio::spawn(async move {
@@ -672,7 +710,7 @@ impl LighterDataClient {
                                 if let Err(e) = Self::process_ws_message(
                                     message,
                                     &market_index_to_instrument,
-                                    &market_price_decimals,
+                                    &market_precisions,
                                     &data_sender,
                                 ) {
                                     tracing::error!("Failed to process WebSocket message: {}", e);
@@ -699,7 +737,7 @@ impl LighterDataClient {
     fn process_ws_message(
         message: crate::websocket::messages::InboundMessage,
         market_index_to_instrument: &Arc<RwLock<AHashMap<u16, InstrumentId>>>,
-        market_price_decimals: &Arc<RwLock<AHashMap<u16, u8>>>,
+        market_precisions: &Arc<RwLock<AHashMap<u16, MarketPrecision>>>,
         data_sender: &tokio::sync::mpsc::UnboundedSender<nautilus_common::messages::DataEvent>,
     ) -> Result<(), LighterError> {
         use crate::websocket::messages::InboundMessage;
@@ -727,31 +765,38 @@ impl LighterDataClient {
                     }
                 };
 
-                // Get price decimals
-                let price_decimals = *market_price_decimals.read().unwrap()
+                let precision = market_precisions.read().unwrap()
                     .get(&market_index)
-                    .unwrap_or(&2);
+                    .copied()
+                    .unwrap_or(MarketPrecision { price_decimals: 2, size_decimals: DEFAULT_SIZE_DECIMALS });
 
-                // Convert bid/ask levels to OrderBookLevel
+                use crate::data::types::parse_decimal_to_raw;
                 let bid_levels: Vec<OrderBookLevel> = bids.iter()
                     .filter_map(|(price_str, size_str)| {
-                        let price = price_str.parse::<u64>().ok()?;
-                        let size = size_str.parse::<u64>().ok()?;
+                        let price = parse_decimal_to_raw(price_str, precision.price_decimals, "bid price").ok()?;
+                        let size = parse_decimal_to_raw(size_str, precision.size_decimals, "bid size").ok()?;
                         Some(OrderBookLevel { price, size })
                     })
                     .collect();
 
                 let ask_levels: Vec<OrderBookLevel> = asks.iter()
                     .filter_map(|(price_str, size_str)| {
-                        let price = price_str.parse::<u64>().ok()?;
-                        let size = size_str.parse::<u64>().ok()?;
+                        let price = parse_decimal_to_raw(price_str, precision.price_decimals, "ask price").ok()?;
+                        let size = parse_decimal_to_raw(size_str, precision.size_decimals, "ask size").ok()?;
                         Some(OrderBookLevel { price, size })
                     })
                     .collect();
 
                 // Convert to OrderBookDelta objects
                 let sequence = timestamp as u64;
-                match parse_order_book_deltas(&bid_levels, &ask_levels, instrument_id, price_decimals, sequence) {
+                match parse_order_book_deltas(
+                    &bid_levels,
+                    &ask_levels,
+                    instrument_id,
+                    precision.price_decimals,
+                    precision.size_decimals,
+                    sequence,
+                ) {
                     Ok(deltas) => {
                         for delta in deltas {
                             let event = DataEvent::Data(nautilus_model::data::Data::Delta(delta));
@@ -789,14 +834,14 @@ impl LighterDataClient {
                     }
                 };
 
-                // Get price decimals
-                let price_decimals = *market_price_decimals.read().unwrap()
+                let precision = market_precisions.read().unwrap()
                     .get(&market_index)
-                    .unwrap_or(&2);
+                    .copied()
+                    .unwrap_or(MarketPrecision { price_decimals: 2, size_decimals: DEFAULT_SIZE_DECIMALS });
 
-                // Parse price and size from strings
-                let price_u64 = price.parse::<u64>().unwrap_or(0);
-                let size_u64 = size.parse::<u64>().unwrap_or(0);
+                use crate::data::types::parse_decimal_to_raw;
+                let price_u64 = parse_decimal_to_raw(&price, precision.price_decimals, "trade price")?;
+                let size_u64 = parse_decimal_to_raw(&size, precision.size_decimals, "trade size")?;
                 let trade_id_u64 = trade_id.parse::<u64>().unwrap_or(0);
 
                 // Create Trade struct for conversion
@@ -809,7 +854,12 @@ impl LighterDataClient {
                     timestamp_ms: timestamp as u64,
                 };
 
-                match parse_trade_tick(&trade, instrument_id, price_decimals) {
+                match parse_trade_tick(
+                    &trade,
+                    instrument_id,
+                    precision.price_decimals,
+                    precision.size_decimals,
+                ) {
                     Ok(tick) => {
                         let event = DataEvent::Data(nautilus_model::data::Data::Trade(tick));
                         if let Err(e) = data_sender.send(event) {
@@ -827,54 +877,70 @@ impl LighterDataClient {
                 }
             }
 
-            InboundMessage::Ticker { market_index, last_price, volume_24h: _, high_24h: _, low_24h: _, timestamp } => {
-                // For ticker, we create a quote tick using last_price for both bid/ask
-                // (This is a simplification - proper implementation would track best bid/ask from orderbook)
-                if let Some(last) = last_price {
+            InboundMessage::Ticker {
+                market_index,
+                last_price: _,
+                bid_price,
+                bid_size,
+                ask_price,
+                ask_size,
+                volume_24h: _,
+                high_24h: _,
+                low_24h: _,
+                timestamp,
+            } => {
+                let (Some(bid_price), Some(bid_size), Some(ask_price), Some(ask_size)) =
+                    (bid_price, bid_size, ask_price, ask_size)
+                else {
                     tracing::debug!(
-                        "Processing ticker for market {}: last_price={}",
-                        market_index,
-                        last
+                        "Skipping ticker quote for market {} because best bid/ask is incomplete",
+                        market_index
                     );
+                    return Ok(());
+                };
 
-                    // Look up instrument ID
-                    let instrument_id = match market_index_to_instrument.read().unwrap().get(&market_index) {
-                        Some(id) => *id,
-                        None => {
-                            tracing::warn!("Unknown market_index {} for ticker", market_index);
-                            return Ok(());
+                let instrument_id = match market_index_to_instrument.read().unwrap().get(&market_index) {
+                    Some(id) => *id,
+                    None => {
+                        tracing::warn!("Unknown market_index {} for ticker", market_index);
+                        return Ok(());
+                    }
+                };
+
+                let precision = market_precisions.read().unwrap()
+                    .get(&market_index)
+                    .copied()
+                    .unwrap_or(MarketPrecision { price_decimals: 2, size_decimals: DEFAULT_SIZE_DECIMALS });
+
+                use crate::data::types::{parse_decimal_to_raw, parse_quote_tick};
+                let bid_price_u64 = parse_decimal_to_raw(&bid_price, precision.price_decimals, "bid price")?;
+                let bid_size_u64 = parse_decimal_to_raw(&bid_size, precision.size_decimals, "bid size")?;
+                let ask_price_u64 = parse_decimal_to_raw(&ask_price, precision.price_decimals, "ask price")?;
+                let ask_size_u64 = parse_decimal_to_raw(&ask_size, precision.size_decimals, "ask size")?;
+
+                match parse_quote_tick(
+                    bid_price_u64,
+                    bid_size_u64,
+                    ask_price_u64,
+                    ask_size_u64,
+                    instrument_id,
+                    precision.price_decimals,
+                    precision.size_decimals,
+                    (timestamp * 1_000_000) as u64, // ms to ns
+                ) {
+                    Ok(tick) => {
+                        let event = DataEvent::Data(nautilus_model::data::Data::Quote(tick));
+                        if let Err(e) = data_sender.send(event) {
+                            tracing::error!("Failed to send quote tick: {}", e);
+                            return Err(LighterError::Internal(format!(
+                                "Failed to send data event: {}", e
+                            )));
                         }
-                    };
-
-                    let price_decimals = *market_price_decimals.read().unwrap()
-                        .get(&market_index)
-                        .unwrap_or(&2);
-
-                    let last_price_u64 = last.parse::<u64>().unwrap_or(0);
-                    let default_size: u64 = 100_000_000; // 1.0 with 8 decimals
-
-                    use crate::data::types::parse_quote_tick;
-                    match parse_quote_tick(
-                        last_price_u64, default_size,
-                        last_price_u64, default_size,
-                        instrument_id,
-                        price_decimals,
-                        (timestamp * 1_000_000) as u64, // ms to ns
-                    ) {
-                        Ok(tick) => {
-                            let event = DataEvent::Data(nautilus_model::data::Data::Quote(tick));
-                            if let Err(e) = data_sender.send(event) {
-                                tracing::error!("Failed to send quote tick: {}", e);
-                                return Err(LighterError::Internal(format!(
-                                    "Failed to send data event: {}", e
-                                )));
-                            }
-                            tracing::trace!("Sent quote tick for {}", instrument_id);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to parse quote tick: {}", e);
-                            return Err(e);
-                        }
+                        tracing::trace!("Sent quote tick for {}", instrument_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse quote tick: {}", e);
+                        return Err(e);
                     }
                 }
             }
@@ -952,7 +1018,7 @@ impl DataClient for LighterDataClient {
         self.symbol_to_instrument_id.write().unwrap().clear();
         self.instrument_to_market_index.write().unwrap().clear();
         self.market_index_to_instrument.write().unwrap().clear();
-        self.market_price_decimals.write().unwrap().clear();
+        self.market_precisions.write().unwrap().clear();
         Ok(())
     }
 
@@ -1021,5 +1087,227 @@ mod tests {
         let config = LighterDataClientConfig::default();
         // Default environment is Mainnet
         assert_eq!(config.environment, LighterEnvironment::Mainnet);
+    }
+
+    #[test]
+    fn test_bar_type_to_lighter_interval() {
+        use crate::data::types::create_bar_type;
+
+        let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
+        let bar_type_1m = create_bar_type(instrument_id, "1m").unwrap();
+        let bar_type_5m = create_bar_type(instrument_id, "5m").unwrap();
+        let bar_type_15m = create_bar_type(instrument_id, "15m").unwrap();
+        let bar_type_1h = create_bar_type(instrument_id, "1h").unwrap();
+        let bar_type_4h = create_bar_type(instrument_id, "4h").unwrap();
+        let bar_type_1d = create_bar_type(instrument_id, "1d").unwrap();
+
+        assert_eq!(bar_type_to_lighter_interval(bar_type_1m).unwrap(), "1m");
+        assert_eq!(bar_type_to_lighter_interval(bar_type_5m).unwrap(), "5m");
+        assert_eq!(bar_type_to_lighter_interval(bar_type_15m).unwrap(), "15m");
+        assert_eq!(bar_type_to_lighter_interval(bar_type_1h).unwrap(), "1h");
+        assert_eq!(bar_type_to_lighter_interval(bar_type_4h).unwrap(), "4h");
+        assert_eq!(bar_type_to_lighter_interval(bar_type_1d).unwrap(), "1d");
+    }
+
+    #[test]
+    fn test_decimal_places_from_market_metadata() {
+        use crate::data::types::decimal_places;
+
+        assert_eq!(decimal_places("0.01", "tick_size").unwrap(), 2);
+        assert_eq!(decimal_places("0.1", "tick_size").unwrap(), 1);
+        assert_eq!(decimal_places("0.0001", "step_size").unwrap(), 4);
+        assert_eq!(decimal_places("0.001", "step_size").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_parse_candlestick_bar() {
+        use crate::data::types::create_bar_type;
+
+        let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
+        let bar_type = create_bar_type(instrument_id, "1h").unwrap();
+        let candle = CandleStick {
+            timestamp: 1_734_200_000_000,
+            open: "4100.00".to_string(),
+            high: "4150.00".to_string(),
+            low: "4090.00".to_string(),
+            close: "4127.50".to_string(),
+            volume: "1234.56".to_string(),
+        };
+
+        let bar = parse_candlestick_bar(&candle, bar_type, 2, 8).unwrap();
+
+        assert_eq!(bar.open.as_f64(), 4100.00);
+        assert_eq!(bar.high.as_f64(), 4150.00);
+        assert_eq!(bar.low.as_f64(), 4090.00);
+        assert_eq!(bar.close.as_f64(), 4127.50);
+        assert_eq!(bar.volume.as_f64(), 1234.56);
+        assert_eq!(bar.ts_event.as_u64(), 1_734_200_000_000_000_000);
+    }
+
+    fn public_ws_test_state(
+    ) -> (
+        Arc<RwLock<AHashMap<u16, InstrumentId>>>,
+        Arc<RwLock<AHashMap<u16, MarketPrecision>>>,
+    ) {
+        let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
+        let market_index_to_instrument = Arc::new(RwLock::new(AHashMap::new()));
+        market_index_to_instrument.write().unwrap().insert(1, instrument_id);
+        let market_precisions = Arc::new(RwLock::new(AHashMap::new()));
+        market_precisions.write().unwrap().insert(
+            1,
+            MarketPrecision {
+                price_decimals: 2,
+                size_decimals: DEFAULT_SIZE_DECIMALS,
+            },
+        );
+        (market_index_to_instrument, market_precisions)
+    }
+
+    #[test]
+    fn test_process_orderbook_snapshot_sends_deltas() {
+        let (market_index_to_instrument, market_precisions) = public_ws_test_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        LighterDataClient::process_ws_message(
+            crate::websocket::messages::InboundMessage::OrderbookSnapshot {
+                market_index: 1,
+                bids: vec![("4127.00".to_string(), "10.5".to_string())],
+                asks: vec![("4128.00".to_string(), "5.2".to_string())],
+                timestamp: 1_734_200_000_000,
+            },
+            &market_index_to_instrument,
+            &market_precisions,
+            &sender,
+        )
+        .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        let second = receiver.try_recv().unwrap();
+        assert!(matches!(
+            first,
+            nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Delta(_))
+        ));
+        assert!(matches!(
+            second,
+            nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Delta(_))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_orderbook_update_sends_deltas() {
+        let (market_index_to_instrument, market_precisions) = public_ws_test_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        LighterDataClient::process_ws_message(
+            crate::websocket::messages::InboundMessage::OrderbookUpdate {
+                market_index: 1,
+                bids: vec![("4127.00".to_string(), "0".to_string())],
+                asks: vec![("4128.00".to_string(), "5.2".to_string())],
+                timestamp: 1_734_200_000_001,
+            },
+            &market_index_to_instrument,
+            &market_precisions,
+            &sender,
+        )
+        .unwrap();
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_trade_sends_trade_tick() {
+        let (market_index_to_instrument, market_precisions) = public_ws_test_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        LighterDataClient::process_ws_message(
+            crate::websocket::messages::InboundMessage::Trade {
+                market_index: 1,
+                trade_id: "12345".to_string(),
+                price: "4127.50".to_string(),
+                size: "10.5".to_string(),
+                is_buy: true,
+                timestamp: 1_734_200_000_000,
+            },
+            &market_index_to_instrument,
+            &market_precisions,
+            &sender,
+        )
+        .unwrap();
+
+        let event = receiver.try_recv().unwrap();
+        match event {
+            nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Trade(tick)) => {
+                assert_eq!(tick.price.as_f64(), 4127.50);
+                assert_eq!(tick.size.as_f64(), 10.5);
+            }
+            _ => panic!("Expected trade tick"),
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_ticker_without_bid_ask_skips_quote() {
+        let (market_index_to_instrument, market_precisions) = public_ws_test_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        LighterDataClient::process_ws_message(
+            crate::websocket::messages::InboundMessage::Ticker {
+                market_index: 1,
+                last_price: Some("4127.50".to_string()),
+                bid_price: None,
+                bid_size: None,
+                ask_price: None,
+                ask_size: None,
+                volume_24h: Some("1000.0".to_string()),
+                high_24h: Some("4200.00".to_string()),
+                low_24h: Some("4100.00".to_string()),
+                timestamp: 1_734_200_000_000,
+            },
+            &market_index_to_instrument,
+            &market_precisions,
+            &sender,
+        )
+        .unwrap();
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_process_ticker_with_bid_ask_sends_quote() {
+        let (market_index_to_instrument, market_precisions) = public_ws_test_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        LighterDataClient::process_ws_message(
+            crate::websocket::messages::InboundMessage::Ticker {
+                market_index: 1,
+                last_price: Some("4127.50".to_string()),
+                bid_price: Some("4127.00".to_string()),
+                bid_size: Some("10.5".to_string()),
+                ask_price: Some("4128.00".to_string()),
+                ask_size: Some("5.2".to_string()),
+                volume_24h: Some("1000.0".to_string()),
+                high_24h: Some("4200.00".to_string()),
+                low_24h: Some("4100.00".to_string()),
+                timestamp: 1_734_200_000_000,
+            },
+            &market_index_to_instrument,
+            &market_precisions,
+            &sender,
+        )
+        .unwrap();
+
+        let event = receiver.try_recv().unwrap();
+        match event {
+            nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Quote(tick)) => {
+                assert_eq!(tick.bid_price.as_f64(), 4127.00);
+                assert_eq!(tick.ask_price.as_f64(), 4128.00);
+                assert_eq!(tick.bid_size.as_f64(), 10.5);
+                assert_eq!(tick.ask_size.as_f64(), 5.2);
+            }
+            _ => panic!("Expected quote tick"),
+        }
     }
 }

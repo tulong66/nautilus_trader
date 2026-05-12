@@ -56,6 +56,7 @@ pub mod config;
 pub mod data;
 pub mod error;
 pub mod execution;
+pub mod factories;
 pub mod http;
 pub mod signing;
 pub mod websocket;
@@ -66,3 +67,6 @@ pub mod python;
 pub use config::{LighterDataClientConfig, LighterExecClientConfig};
 pub use error::LighterError;
 pub use execution::LighterExecutionClient;
+pub use factories::{
+    LighterDataClientFactory, LighterExecFactoryConfig, LighterExecutionClientFactory,
+};

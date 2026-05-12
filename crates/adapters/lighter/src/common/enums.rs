@@ -19,12 +19,24 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
 /// Lighter environment (network).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.lighter")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.lighter",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.lighter")
 )]
 pub enum LighterEnvironment {
     /// Lighter mainnet.
@@ -64,7 +76,9 @@ impl LighterEnvironment {
 }
 
 /// Lighter order type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString,
+)]
 #[repr(u8)]
 pub enum LighterOrderType {
     /// Limit order.
@@ -83,7 +97,9 @@ impl LighterOrderType {
 }
 
 /// Lighter time-in-force.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString,
+)]
 #[repr(u8)]
 pub enum LighterTimeInForce {
     /// Good till time (default 28 days).
@@ -141,7 +157,9 @@ pub enum LighterOrderStatus {
 }
 
 /// Lighter market status.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LighterMarketStatus {
     /// Market is active and trading.

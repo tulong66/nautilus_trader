@@ -17,24 +17,16 @@
 
 use pyo3::prelude::*;
 
-use crate::common::{
-    LighterEnvironment,
-    consts::{
-        LIGHTER_MAINNET_HTTP_URL, LIGHTER_MAINNET_WS_URL,
-        LIGHTER_TESTNET_HTTP_URL, LIGHTER_TESTNET_WS_URL,
-    },
-};
+use crate::common::LighterEnvironment;
 
 /// Get the HTTP base URL for Lighter based on environment.
 #[pyfunction]
 #[pyo3(name = "get_lighter_http_url")]
 #[must_use]
 pub fn py_get_lighter_http_url(is_testnet: bool) -> String {
-    if is_testnet {
-        LIGHTER_TESTNET_HTTP_URL.to_string()
-    } else {
-        LIGHTER_MAINNET_HTTP_URL.to_string()
-    }
+    py_get_lighter_environment(is_testnet)
+        .http_url()
+        .to_string()
 }
 
 /// Get the WebSocket URL for Lighter based on environment.
@@ -42,11 +34,7 @@ pub fn py_get_lighter_http_url(is_testnet: bool) -> String {
 #[pyo3(name = "get_lighter_ws_url")]
 #[must_use]
 pub fn py_get_lighter_ws_url(is_testnet: bool) -> String {
-    if is_testnet {
-        LIGHTER_TESTNET_WS_URL.to_string()
-    } else {
-        LIGHTER_MAINNET_WS_URL.to_string()
-    }
+    py_get_lighter_environment(is_testnet).ws_url().to_string()
 }
 
 /// Get the environment enum from a boolean flag.

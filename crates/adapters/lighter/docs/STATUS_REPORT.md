@@ -1,7 +1,53 @@
 # Lighter DEX Adapter - 开发状态报告
 
-> **最后更新**: 2025-12-15
-> **状态**: ✅ 核心功能开发完成
+> **最后更新**: 2026-05-12
+> **状态**: ⚠️ Rust 骨架可编译/测试通过；Nautilus Python/Live 接入与执行回报闭环未完成
+
+---
+
+## 2026-05-12 缺口审计与 TODO
+
+### 一句话结论
+
+当前 `nautilus-lighter` 已是可编译的 Rust adapter 原型，但还不是 NautilusTrader 标准可配置 live adapter；下一阶段优先补齐 Python/PyO3/factory 接入和数据/执行闭环，不推进任何实盘资金路径。
+
+### P0 — 接入层最小闭环
+
+- [x] 在 workspace dependencies 中注册 `nautilus-lighter`，并让 `crates/pyo3` 依赖它。
+- [x] 在 `crates/pyo3/src/lib.rs` 注册 `nautilus_lighter::python::lighter` 子模块。
+- [x] 新增 `crates/adapters/lighter/src/factories.rs`，实现 `LighterDataClientFactory` / `LighterExecutionClientFactory`。
+- [x] 新增 `LighterExecFactoryConfig`，显式承载 `TraderId` / `AccountId` / `LighterExecClientConfig`。
+- [x] 扩展 `crates/adapters/lighter/src/python/`，暴露 config + factories，并注册 Nautilus 全局 factory/config extractor。
+- [x] 新增 `nautilus_trader/adapters/lighter/` Python 包装层，至少包含 `__init__.py`、`config.py`、`factories.py`、`constants.py`。
+- [x] 新增只导入的 Python smoke test：`tests/integration_tests/adapters/lighter/test_imports.py`。
+- [x] 运行 Python runtime smoke test：`uv run --project ... --group test pytest tests/integration_tests/adapters/lighter/test_imports.py -q`，结果 3 passed；stable Rust 已更新到 1.95.0。
+
+### P0 — Public data / paper recorder 前置
+
+- [x] 修复 `LighterDataClient::request_bars()`：candlestick 响应已转换为 Nautilus `Bar`，并覆盖 1m/5m/15m/1h/4h/1d interval 映射。
+- [x] 从 Lighter market metadata 派生真实 `price_decimals` / `size_decimals`：`tickSize` -> price precision，`stepSize` -> size precision，并用于 bar/orderbook/trade/ticker 转换。
+- [x] 修复 ticker 到 `QuoteTick` 的简化逻辑：不再用 last price 伪造 bid/ask；只有 ticker 携带真实 best bid/ask 和 size 时才生成 `QuoteTick`。
+- [x] 增加 public WS 数据路径测试：orderbook snapshot/update、trade、ticker，以及重连后订阅恢复消息构造。
+
+### P1 — Execution 事件闭环
+
+- [ ] WebSocket order update 需要生成 Nautilus order accepted / rejected / filled / canceled 等执行事件。
+- [ ] WebSocket account update 需要生成账户状态事件，而不是只写 log。
+- [ ] 实现 `generate_order_status_report(s)`、`generate_fill_reports`、`generate_position_status_reports`、`generate_mass_status`。
+- [ ] 将执行侧 market_index 和 price_decimals 从真实 market cache 获取，移除 ETH/BTC/SOL/DOGE 硬编码。
+
+### P1 — 安全边界
+
+- [ ] 保持 no-withdraw/no-transfer signing surface；当前只应允许 create order / cancel order / cancel all / auth token。
+- [ ] live 前增加 signer wrapper / capability whitelist / stage gate。
+- [ ] 不读取 `.env`、wallet、key 文件；不调用 Lighter mainnet 下单；不运行任何真实资金命令。
+
+### P2 — 后置研究/增强
+
+- [ ] funding endpoint 与 funding history 解析。
+- [ ] Standard 200/300ms latency、sequencer reject、`sendTx code=200 != executed` 建模。
+- [ ] liquidation / IMR / MMR / CMR 风险模型。
+- [ ] maker-vs-taking / quote skew 研究仅在 signal-driven execution 明确需要后推进。
 
 ---
 

@@ -140,6 +140,14 @@ impl LighterPrivateConfig {
 
 /// NautilusTrader Data Client configuration.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.lighter", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.lighter")
+)]
 pub struct LighterDataClientConfig {
     /// Environment (Mainnet/Testnet).
     pub environment: LighterEnvironment,
@@ -184,6 +192,14 @@ impl LighterDataClientConfig {
 
 /// NautilusTrader Execution Client configuration.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.lighter", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.lighter")
+)]
 pub struct LighterExecClientConfig {
     /// API private key (40 bytes / 80 hex chars).
     pub private_key: String,

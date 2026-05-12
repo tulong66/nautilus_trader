@@ -34,14 +34,17 @@ extension-module = [
   "pyo3/extension-module",
 ]
 python = [
+  "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-data/python",
   "nautilus-execution/python",
   "nautilus-model/python",
   "nautilus-network/python",
+  "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
+  "pyo3-stub-gen",
 ]
 
 [package.metadata.docs.rs]
@@ -57,6 +60,7 @@ nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 nautilus-serialization = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -99,6 +103,7 @@ num-bigint = "0.4"             # Big integer arithmetic for field operations
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }

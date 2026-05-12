@@ -18,6 +18,8 @@
 //! Provides functions to convert between Lighter API types and NautilusTrader
 //! data types, handling the critical price decimal conversions.
 
+use std::str::FromStr;
+
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
@@ -30,6 +32,7 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use ustr::Ustr;
 
 use crate::{
@@ -38,7 +41,7 @@ use crate::{
 };
 
 /// Default size decimals used by Lighter (8 decimals for base amounts).
-const DEFAULT_SIZE_DECIMALS: u8 = 8;
+pub(crate) const DEFAULT_SIZE_DECIMALS: u8 = 8;
 
 /// Converts a Lighter `MarketInfo` to a NautilusTrader `CryptoFuture` instrument.
 ///
@@ -173,6 +176,7 @@ pub fn parse_order_book_deltas(
     asks: &[OrderBookLevel],
     instrument_id: InstrumentId,
     price_decimals: u8,
+    size_decimals: u8,
     sequence: u64,
 ) -> Result<Vec<OrderBookDelta>, LighterError> {
     let mut deltas = Vec::with_capacity(bids.len() + asks.len());
@@ -182,7 +186,7 @@ pub fn parse_order_book_deltas(
     // Process bids
     for level in bids {
         let price = convert_price(level.price, price_decimals)?;
-        let size = convert_quantity(level.size, DEFAULT_SIZE_DECIMALS)?;
+        let size = convert_quantity(level.size, size_decimals)?;
 
         // Determine action based on size (0 = delete, else add/update)
         let action = if level.size == 0 {
@@ -212,7 +216,7 @@ pub fn parse_order_book_deltas(
     // Process asks
     for level in asks {
         let price = convert_price(level.price, price_decimals)?;
-        let size = convert_quantity(level.size, DEFAULT_SIZE_DECIMALS)?;
+        let size = convert_quantity(level.size, size_decimals)?;
 
         let action = if level.size == 0 {
             BookAction::Delete
@@ -264,9 +268,10 @@ pub fn parse_trade_tick(
     trade: &Trade,
     instrument_id: InstrumentId,
     price_decimals: u8,
+    size_decimals: u8,
 ) -> Result<TradeTick, LighterError> {
     let price = convert_price(trade.price, price_decimals)?;
-    let size = convert_quantity(trade.size, DEFAULT_SIZE_DECIMALS)?;
+    let size = convert_quantity(trade.size, size_decimals)?;
 
     // Map is_taker_ask to AggressorSide
     // true = taker was selling = aggressor SELLER
@@ -305,6 +310,7 @@ pub fn parse_trade_tick(
 /// * `ask_size` - Best ask size (raw integer)
 /// * `instrument_id` - The instrument ID
 /// * `price_decimals` - Number of decimals for price conversion
+/// * `size_decimals` - Number of decimals for quote size conversion
 /// * `timestamp_ns` - Timestamp in nanoseconds
 ///
 /// # Errors
@@ -317,12 +323,13 @@ pub fn parse_quote_tick(
     ask_size: u64,
     instrument_id: InstrumentId,
     price_decimals: u8,
+    size_decimals: u8,
     timestamp_ns: u64,
 ) -> Result<QuoteTick, LighterError> {
     let bid = convert_price(bid_price, price_decimals)?;
     let ask = convert_price(ask_price, price_decimals)?;
-    let bid_qty = convert_quantity(bid_size, DEFAULT_SIZE_DECIMALS)?;
-    let ask_qty = convert_quantity(ask_size, DEFAULT_SIZE_DECIMALS)?;
+    let bid_qty = convert_quantity(bid_size, size_decimals)?;
+    let ask_qty = convert_quantity(ask_size, size_decimals)?;
 
     let ts_event = UnixNanos::from(timestamp_ns);
     let ts_init = ts_event;
@@ -338,6 +345,40 @@ pub fn parse_quote_tick(
     ))
 }
 
+pub fn decimal_places(value: &str, field_name: &str) -> Result<u8, LighterError> {
+    let decimal = Decimal::from_str(value).map_err(|e| {
+        LighterError::Parse(format!("Failed to parse {field_name} '{value}': {e}"))
+    })?;
+
+    if decimal <= Decimal::ZERO {
+        return Err(LighterError::Parse(format!(
+            "{field_name} '{value}' must be positive"
+        )));
+    }
+
+    u8::try_from(decimal.normalize().scale()).map_err(|e| {
+        LighterError::Parse(format!("Failed to derive decimal places for {field_name} '{value}': {e}"))
+    })
+}
+
+pub fn parse_decimal_to_raw(value: &str, decimals: u8, field_name: &str) -> Result<u64, LighterError> {
+    let decimal = Decimal::from_str(value).map_err(|e| {
+        LighterError::Parse(format!("Failed to parse {field_name} '{value}': {e}"))
+    })?;
+    let scale = Decimal::from(10u64.pow(decimals as u32));
+    let raw = decimal * scale;
+
+    if raw.fract() != Decimal::ZERO {
+        return Err(LighterError::Parse(format!(
+            "{field_name} '{value}' exceeds {decimals} decimal places"
+        )));
+    }
+
+    raw.to_u64().ok_or_else(|| {
+        LighterError::Parse(format!("Failed to convert {field_name} '{value}' to raw integer"))
+    })
+}
+
 /// Converts a Lighter bar/candle to a NautilusTrader `Bar`.
 ///
 /// # Arguments
@@ -349,6 +390,7 @@ pub fn parse_quote_tick(
 /// * `volume` - Volume (raw)
 /// * `bar_type` - The bar type for this bar
 /// * `price_decimals` - Number of decimals for price conversion
+/// * `size_decimals` - Number of decimals for volume conversion
 /// * `timestamp_ns` - Bar timestamp in nanoseconds
 ///
 /// # Errors
@@ -362,13 +404,14 @@ pub fn parse_bar(
     volume: u64,
     bar_type: BarType,
     price_decimals: u8,
+    size_decimals: u8,
     timestamp_ns: u64,
 ) -> Result<Bar, LighterError> {
     let open_price = convert_price(open, price_decimals)?;
     let high_price = convert_price(high, price_decimals)?;
     let low_price = convert_price(low, price_decimals)?;
     let close_price = convert_price(close, price_decimals)?;
-    let vol = convert_quantity(volume, DEFAULT_SIZE_DECIMALS)?;
+    let vol = convert_quantity(volume, size_decimals)?;
 
     let ts_event = UnixNanos::from(timestamp_ns);
     let ts_init = ts_event;
@@ -490,6 +533,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_places() {
+        assert_eq!(decimal_places("0.01", "tick_size").unwrap(), 2);
+        assert_eq!(decimal_places("0.0001", "step_size").unwrap(), 4);
+        assert_eq!(decimal_places("1.0000", "step_size").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_decimal_to_raw_price() {
+        let raw = parse_decimal_to_raw("4127.39", 2, "price").unwrap();
+        assert_eq!(raw, 412_739);
+    }
+
+    #[test]
+    fn test_parse_decimal_to_raw_volume() {
+        let raw = parse_decimal_to_raw("1234.56", 8, "volume").unwrap();
+        assert_eq!(raw, 123_456_000_000);
+    }
+
+    #[test]
+    fn test_parse_decimal_to_raw_rejects_extra_precision() {
+        let result = parse_decimal_to_raw("4127.391", 2, "price");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_create_bar_type_1m() {
         let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
         let bar_type = create_bar_type(instrument_id, "1m").unwrap();
@@ -524,7 +592,7 @@ mod tests {
         };
 
         let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
-        let tick = parse_trade_tick(&trade, instrument_id, 2).unwrap();
+        let tick = parse_trade_tick(&trade, instrument_id, 2, 8).unwrap();
 
         assert_eq!(tick.price.as_f64(), 4127.39);
         assert_eq!(tick.size.as_f64(), 1.0);
@@ -541,6 +609,7 @@ mod tests {
             200_000_000, // ask size (2.0)
             instrument_id,
             2, // price_decimals
+            8, // size_decimals
             1700000000000000000, // timestamp_ns
         ).unwrap();
 
@@ -561,7 +630,7 @@ mod tests {
         ];
 
         let instrument_id = InstrumentId::from("ETH_USDC.LIGHTER");
-        let deltas = parse_order_book_deltas(&bids, &asks, instrument_id, 2, 1).unwrap();
+        let deltas = parse_order_book_deltas(&bids, &asks, instrument_id, 2, 8, 1).unwrap();
 
         assert_eq!(deltas.len(), 3);
         assert_eq!(deltas[0].order.side, OrderSide::Buy);

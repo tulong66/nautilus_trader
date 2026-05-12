@@ -122,13 +122,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InboundMessage::Ticker {
                 market_index,
                 last_price,
+                bid_price,
+                ask_price,
                 volume_24h,
                 high_24h,
                 low_24h,
                 timestamp,
+                ..
             } => {
-                info!("Ticker update for market {}: last={:?}, 24h vol={:?}, high={:?}, low={:?} at {}",
-                    market_index, last_price, volume_24h, high_24h, low_24h, timestamp);
+                info!("Ticker update for market {}: last={:?}, bid={:?}, ask={:?}, 24h vol={:?}, high={:?}, low={:?} at {}",
+                    market_index, last_price, bid_price, ask_price, volume_24h, high_24h, low_24h, timestamp);
             }
 
             InboundMessage::OrderUpdate {

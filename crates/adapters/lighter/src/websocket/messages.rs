@@ -147,6 +147,14 @@ pub enum InboundMessage {
         market_index: u16,
         /// Last price.
         last_price: Option<String>,
+        /// Best bid price.
+        bid_price: Option<String>,
+        /// Best bid size.
+        bid_size: Option<String>,
+        /// Best ask price.
+        ask_price: Option<String>,
+        /// Best ask size.
+        ask_size: Option<String>,
         /// 24h volume.
         volume_24h: Option<String>,
         /// 24h high.
@@ -551,6 +559,26 @@ impl InboundMessage {
         let stats = value.get("market_stats").unwrap_or(value);
 
         let last_price = stats.get("last_price").map(Self::value_to_string);
+        let bid_price = stats
+            .get("best_bid")
+            .or_else(|| stats.get("bid"))
+            .or_else(|| stats.get("bid_price"))
+            .map(Self::value_to_string);
+        let bid_size = stats
+            .get("best_bid_size")
+            .or_else(|| stats.get("bid_size"))
+            .or_else(|| stats.get("bid_quantity"))
+            .map(Self::value_to_string);
+        let ask_price = stats
+            .get("best_ask")
+            .or_else(|| stats.get("ask"))
+            .or_else(|| stats.get("ask_price"))
+            .map(Self::value_to_string);
+        let ask_size = stats
+            .get("best_ask_size")
+            .or_else(|| stats.get("ask_size"))
+            .or_else(|| stats.get("ask_quantity"))
+            .map(Self::value_to_string);
         let volume_24h = stats
             .get("volume_24h")
             .or_else(|| stats.get("volume"))
@@ -572,6 +600,10 @@ impl InboundMessage {
         Ok(Self::Ticker {
             market_index,
             last_price,
+            bid_price,
+            bid_size,
+            ask_price,
+            ask_size,
             volume_24h,
             high_24h,
             low_24h,
@@ -763,6 +795,10 @@ impl InboundMessage {
             as u16;
 
         let last_price = value.get("last_price").and_then(|v| v.as_str()).map(String::from);
+        let bid_price = value.get("best_bid").and_then(|v| v.as_str()).map(String::from);
+        let bid_size = value.get("best_bid_size").and_then(|v| v.as_str()).map(String::from);
+        let ask_price = value.get("best_ask").and_then(|v| v.as_str()).map(String::from);
+        let ask_size = value.get("best_ask_size").and_then(|v| v.as_str()).map(String::from);
         let volume_24h = value.get("volume_24h").and_then(|v| v.as_str()).map(String::from);
         let high_24h = value.get("high_24h").and_then(|v| v.as_str()).map(String::from);
         let low_24h = value.get("low_24h").and_then(|v| v.as_str()).map(String::from);
@@ -775,6 +811,10 @@ impl InboundMessage {
         Ok(Self::Ticker {
             market_index,
             last_price,
+            bid_price,
+            bid_size,
+            ask_price,
+            ask_size,
             volume_24h,
             high_24h,
             low_24h,
@@ -1068,6 +1108,10 @@ mod tests {
             "channel": "market_stats:1",
             "market_stats": {
                 "last_price": "4127.50",
+                "best_bid": "4127.00",
+                "best_bid_size": "10.5",
+                "best_ask": "4128.00",
+                "best_ask_size": "5.2",
                 "volume_24h": "1000.0",
                 "high_24h": "4200.00",
                 "low_24h": "4100.00"
@@ -1082,6 +1126,10 @@ mod tests {
             InboundMessage::Ticker {
                 market_index,
                 last_price,
+                bid_price,
+                bid_size,
+                ask_price,
+                ask_size,
                 volume_24h,
                 high_24h,
                 low_24h,
@@ -1089,6 +1137,10 @@ mod tests {
             } => {
                 assert_eq!(market_index, 1);
                 assert_eq!(last_price, Some("4127.50".to_string()));
+                assert_eq!(bid_price, Some("4127.00".to_string()));
+                assert_eq!(bid_size, Some("10.5".to_string()));
+                assert_eq!(ask_price, Some("4128.00".to_string()));
+                assert_eq!(ask_size, Some("5.2".to_string()));
                 assert_eq!(volume_24h, Some("1000.0".to_string()));
                 assert_eq!(high_24h, Some("4200.00".to_string()));
                 assert_eq!(low_24h, Some("4100.00".to_string()));
@@ -1183,6 +1235,10 @@ mod tests {
             InboundMessage::Ticker {
                 market_index,
                 last_price,
+                bid_price,
+                bid_size,
+                ask_price,
+                ask_size,
                 volume_24h,
                 high_24h,
                 low_24h,
@@ -1190,6 +1246,10 @@ mod tests {
             } => {
                 assert_eq!(market_index, 1);
                 assert_eq!(last_price, Some("4127.50".to_string()));
+                assert_eq!(bid_price, None);
+                assert_eq!(bid_size, None);
+                assert_eq!(ask_price, None);
+                assert_eq!(ask_size, None);
                 assert_eq!(volume_24h, Some("1000.0".to_string()));
                 assert_eq!(high_24h, Some("4200.00".to_string()));
                 assert_eq!(low_24h, Some("4100.00".to_string()));

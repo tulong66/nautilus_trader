@@ -103,6 +103,7 @@ nautilus-databento = { path = "crates/adapters/databento", version = "0.56.0", d
 nautilus-deribit = { path = "crates/adapters/deribit", version = "0.56.0", default-features = false }
 nautilus-dydx = { path = "crates/adapters/dydx", version = "0.56.0", default-features = false }
 nautilus-hyperliquid = { path = "crates/adapters/hyperliquid", version = "0.56.0", default-features = false }
+nautilus-lighter = { path = "crates/adapters/lighter", version = "0.56.0", default-features = false }
 nautilus-interactive-brokers = { path = "crates/adapters/interactive_brokers", version = "0.56.0" }
 nautilus-kraken = { path = "crates/adapters/kraken", version = "0.56.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.56.0", default-features = false }
