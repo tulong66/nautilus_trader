@@ -39,6 +39,7 @@
 //! See [`crate::signing`] for implementation details.
 
 pub mod client;
+pub mod dispatch;
 pub mod fixtures;
 
 pub use client::LighterExecutionClient;

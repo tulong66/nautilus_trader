@@ -40,8 +40,8 @@
 | ID | 任务 | 状态 | 可并行性 | 验收标准 |
 |----|------|------|----------|----------|
 | A | 建立 execution fixture 基础层：定义 offline order/account/fill/position fixtures，覆盖 accepted/rejected/partial fill/filled/canceled/cancel rejected/account update | [x] | 前置 | 已新增 `execution::fixtures` 与 `tests/execution_fixtures.rs`；fixture 不含真实凭证；`cargo +1.95.0 test -p nautilus-lighter` 通过 |
-| B | WebSocket order update dispatch：把 private `OrderUpdate` 映射为 Nautilus accepted/rejected/filled/canceled/cancel-rejected 等执行事件候选 | [ ] | A 后可并行 | mock WS message 能生成确定性 dispatch outcome；不连接真实 private WS |
-| C | WebSocket account update dispatch：把 private `AccountUpdate` 映射为账户余额/状态更新候选，而不是只写 log | [ ] | A 后可并行 | mock account update 能生成 account state/report outcome；不使用真实 token |
+| B | WebSocket order update dispatch：把 private `OrderUpdate` 映射为 Nautilus accepted/rejected/filled/canceled/cancel-rejected 等执行事件候选 | [x] | A 后可并行 | 已新增 `execution::dispatch` 与 `tests/execution_dispatch.rs`；mock WS message 能生成确定性 dispatch outcome；不连接真实 private WS |
+| C | WebSocket account update dispatch：把 private `AccountUpdate` 映射为账户余额/状态更新候选，而不是只写 log | [x] | A 后可并行 | 已新增 account dispatch outcome；mock account update 能生成 account state/report outcome；不使用真实 token |
 | D | Order status reports：实现 `generate_order_status_report(s)` 的 fixture-backed 转换、过滤和空结果语义 | [ ] | A 后可并行 | open/filled/canceled/rejected fixtures 可转 Nautilus `OrderStatusReport`；过滤条件有测试 |
 | E | Fill / position / mass reports：实现 `generate_fill_reports`、`generate_position_status_reports`、`generate_mass_status` | [ ] | A 后可并行 | fill/position fixtures 可转 report；mass status 汇总 orders/fills/positions |
 | F | Execution client wiring：把 B/C/D/E 的纯转换层接入 `LighterExecutionClient`，保留 mock/offline 可测路径 | [ ] | 依赖 B/C/D/E | `cargo +1.95.0 check -p nautilus-lighter --features python` 通过；不新增 live 默认路径 |
