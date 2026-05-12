@@ -49,18 +49,30 @@
 | H | Safety surface audit：确认 signing surface 只暴露 create order / cancel order / cancel all / auth token；withdraw/transfer/leverage/margin 不进入策略路径 | [x] | 可并行 | `signing_surface` 测试证明 strategy surface 只列 create/auth/cancel/cancel-all；代码搜索未发现 withdraw/transfer/leverage/margin 签名路径 |
 | I | Verification + docs：运行完整验证并更新本状态报告、Track B plan 指针 | [x] | 收尾 | `cargo +1.95.0 test -p nautilus-lighter` 通过（129 passed, 2 ignored）；`cargo +1.95.0 check -p nautilus-lighter --features python` 通过；Python import smoke test 3 passed；本任务板已按实际完成状态更新 |
 
-### P1 — 安全边界
+### P2 — 下一阶段任务板：live 前安全门与生产接入准备
 
-- [ ] 保持 no-withdraw/no-transfer signing surface；当前只应允许 create order / cancel order / cancel all / auth token。
-- [ ] live 前增加 signer wrapper / capability whitelist / stage gate。
-- [ ] 不读取 `.env`、wallet、key 文件；不调用 Lighter mainnet 下单；不运行任何真实资金命令。
+> 目标：在不进入真实资金路径的前提下，把 adapter 从 mock/offline execution 闭环推进到 testnet/paper-ready 的受控 live-prep 状态。
+>
+> 安全边界：继续保持 no-withdraw/no-transfer signing surface；不读取 `.env`、wallet、key 文件；不调用 Lighter mainnet 下单；不使用真实 private WS credentials；不运行任何真实资金命令。
+>
+> 并行策略：J 是安全前置；K/L/M/N/O/P/Q 可在 J 后并行推进；R 依赖 J-Q 的验证结果收尾。若某项发现必须触碰认证、私钥、真实账号、真实下单、提现、授权或部署，立即停止并升级为人工决策。
 
-### P2 — 后置研究/增强
+| ID | 任务 | 状态 | 可并行性 | 验收标准 |
+|----|------|------|----------|----------|
+| J | Signer wrapper / capability whitelist / stage gate：把 create order / cancel order / cancel all / auth token 之外的签名能力从策略路径硬隔离 | [ ] | 前置 | 默认配置无法进入 live signing；测试覆盖 withdraw/transfer/leverage/margin 等能力不在策略 surface；无真实 key/secret 读取 |
+| K | Private WS/auth dry-run harness：建立可注入 token/auth stub 与 private channel 订阅重放测试 | [ ] | J 后可并行 | 使用 fixture/stub 验证 auth/subscription/order/account message flow；不读取 `.env`；不连接真实 private WS |
+| L | Live report API 设计与 mock server 接入：为 order/fill/position/mass report 设计真实数据来源接口，但只用 mock server 验证 | [ ] | J 后可并行 | 默认 live 路径仍受 stage gate 保护；mock REST/WS 能返回确定性 reports；空结果/错误/分页语义有测试 |
+| M | Execution state reconciliation：建立 send/order update/account update/fill/cancel/cancel-reject 的状态机与去重规则 | [ ] | J 后可并行 | fixture/replay 覆盖 partial fill、filled、canceled、cancel rejected、重复消息、乱序消息；不产生真实订单 |
+| N | Sequencer 与 `sendTx` 语义建模：区分 accepted/submitted/executed/rejected，处理 `code=200` 但未 executed 的状态 | [ ] | J 后可并行 | mock response 覆盖 sequencer reject、timeout、pending、executed、`code=200 != executed`；不会把 submitted 误报为 filled |
+| O | Latency / retry / rate-limit 模型：整理 Standard 200/300ms latency、超时、重试、退避和限流策略 | [ ] | J 后可并行 | 单元测试覆盖 retry budget、timeout、rate-limit backoff；文档明确哪些路径可重试、哪些必须 fail-fast |
+| P | Funding / margin / liquidation 风险输入：解析 funding endpoint/history，并建模 IMR/MMR/CMR/liquidation 前置数据 | [ ] | J 后可并行 | fixture-backed parser 覆盖 funding history、margin ratios、liquidation thresholds；不接入真实账户风险动作 |
+| Q | Paper/replay soak 验证：用录制 public/private fixture 长时间回放，验证 execution/account/report 一致性 | [ ] | J 后可并行 | replay 不需要认证；覆盖断线重连、订阅恢复、重复消息、空账户/空订单；输出可复现实验记录 |
+| R | Verification + docs：完成下一阶段验证并更新状态报告与 Track B 指针 | [ ] | 依赖 J-Q | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python smoke test 通过；本任务板按实际结果更新 |
 
-- [ ] funding endpoint 与 funding history 解析。
-- [ ] Standard 200/300ms latency、sequencer reject、`sendTx code=200 != executed` 建模。
-- [ ] liquidation / IMR / MMR / CMR 风险模型。
+### P3 — 延后研究/增强
+
 - [ ] maker-vs-taking / quote skew 研究仅在 signal-driven execution 明确需要后推进。
+- [ ] 真实 testnet/private credential 流程只在 J-R 全部完成并人工批准后另起安全审计任务。
 
 ---
 
