@@ -39,7 +39,7 @@
 
 | ID | 任务 | 状态 | 可并行性 | 验收标准 |
 |----|------|------|----------|----------|
-| A | 建立 execution fixture 基础层：定义 offline order/account/fill/position fixtures，覆盖 accepted/rejected/partial fill/filled/canceled/cancel rejected/account update | [ ] | 前置 | fixture 不含真实凭证；`cargo +1.95.0 test -p nautilus-lighter --test execution_*` 可运行 |
+| A | 建立 execution fixture 基础层：定义 offline order/account/fill/position fixtures，覆盖 accepted/rejected/partial fill/filled/canceled/cancel rejected/account update | [x] | 前置 | 已新增 `execution::fixtures` 与 `tests/execution_fixtures.rs`；fixture 不含真实凭证；`cargo +1.95.0 test -p nautilus-lighter` 通过 |
 | B | WebSocket order update dispatch：把 private `OrderUpdate` 映射为 Nautilus accepted/rejected/filled/canceled/cancel-rejected 等执行事件候选 | [ ] | A 后可并行 | mock WS message 能生成确定性 dispatch outcome；不连接真实 private WS |
 | C | WebSocket account update dispatch：把 private `AccountUpdate` 映射为账户余额/状态更新候选，而不是只写 log | [ ] | A 后可并行 | mock account update 能生成 account state/report outcome；不使用真实 token |
 | D | Order status reports：实现 `generate_order_status_report(s)` 的 fixture-backed 转换、过滤和空结果语义 | [ ] | A 后可并行 | open/filled/canceled/rejected fixtures 可转 Nautilus `OrderStatusReport`；过滤条件有测试 |
