@@ -41,5 +41,6 @@
 pub mod client;
 pub mod dispatch;
 pub mod fixtures;
+pub mod reports;
 
 pub use client::LighterExecutionClient;
