@@ -68,7 +68,7 @@
 | N | Sequencer 与 `sendTx` 语义建模：区分 accepted/submitted/executed/rejected，处理 `code=200` 但未 executed 的状态 | [x] | J 后可并行 | 已新增 fixture/mock response 语义解释与 reconciliation 记录：覆盖 sequencer reject、timeout、pending、executed、`code=200 != executed`；submitted/executed/pending/timeout 均不会被 sendTx alone 误报为 filled；`cargo +1.95.0 test -p nautilus-lighter` 与 `cargo +1.95.0 check -p nautilus-lighter --features python` 通过 |
 | O | Latency / retry / rate-limit 模型：整理 Standard 200/300ms latency、超时、重试、退避和限流策略 | [x] | J 后可并行 | 已新增 `http::retry::LighterRetryPolicy`；单元测试覆盖 retry budget、timeout、429/rate-limit backoff、fail-fast 分类；HTTP mock 测试覆盖 429 retry 与 401 auth fail-fast |
 | P | Funding / margin / liquidation 风险输入：解析 funding endpoint/history，并建模 IMR/MMR/CMR/liquidation 前置数据 | [x] | J 后可并行 | 已新增只读 funding history、margin ratio(IMR/MMR/CMR)、liquidation threshold DTO/parser；fixture-backed tests 覆盖 success、empty list、missing field、invalid number；不接入真实账户风险动作 |
-| Q | Paper/replay soak 验证：用录制 public/private fixture 长时间回放，验证 execution/account/report 一致性 | [ ] | J 后可并行 | replay 不需要认证；覆盖断线重连、订阅恢复、重复消息、空账户/空订单；输出可复现实验记录 |
+| Q | Paper/replay soak 验证：用录制 public/private fixture 长时间回放，验证 execution/account/report 一致性 | [x] | J 后可并行 | 已新增 `execution::replay` 离线 fixture-backed soak harness 与 `tests/execution_soak.rs`；实验 `fixture:p2-q-fixture-soak;rounds:3;disconnect_reconnect:true;duplicates:true;empty:true;network:none` 覆盖断线重连、订阅恢复、重复消息、空账户/空订单，并校验 execution/account/report 一致性；不认证、不连接真实 private WS |
 | R | Verification + docs：完成下一阶段验证并更新状态报告与 Track B 指针 | [ ] | 依赖 J-Q | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python smoke test 通过；本任务板按实际结果更新 |
 
 #### P2-O retry / timeout / rate-limit 策略说明
