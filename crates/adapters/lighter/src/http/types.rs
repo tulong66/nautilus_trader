@@ -265,6 +265,74 @@ pub struct OrderResponse {
     pub updated_at: i64,
 }
 
+/// Funding history entry used as read-only risk input.
+///
+/// This DTO models funding-rate data only; it does not authorize or trigger any account action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingHistoryEntry {
+    /// Market index for this funding observation.
+    pub market_index: u16,
+    /// Funding rate as reported by Lighter.
+    pub funding_rate: String,
+    /// Premium index when present in the funding payload.
+    pub premium_index: Option<String>,
+    /// Oracle price used for the funding observation.
+    pub oracle_price: Option<String>,
+    /// Mark price used for the funding observation.
+    pub mark_price: Option<String>,
+    /// Observation timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+/// Read-only margin-ratio risk input for an account or market/account pair.
+///
+/// This DTO intentionally contains only parser-facing risk inputs and no mutation fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginRatioResponse {
+    /// Account index for the risk snapshot.
+    pub account_index: i64,
+    /// Optional market index when ratios are market-specific.
+    pub market_index: Option<u16>,
+    /// Initial margin ratio.
+    pub initial_margin_ratio: String,
+    /// Maintenance margin ratio.
+    pub maintenance_margin_ratio: String,
+    /// Closeout margin ratio.
+    pub closeout_margin_ratio: String,
+    /// Current margin fraction when reported.
+    pub margin_fraction: Option<String>,
+    /// Total collateral/equity backing the account.
+    pub total_collateral: Option<String>,
+    /// Position notional used to derive ratio exposure.
+    pub position_notional: Option<String>,
+    /// Snapshot timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+/// Read-only liquidation threshold risk input for a market position.
+///
+/// This DTO is a parser/model input only and does not model liquidation actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidationThresholdResponse {
+    /// Account index for the threshold snapshot.
+    pub account_index: i64,
+    /// Market index for the threshold snapshot.
+    pub market_index: u16,
+    /// Estimated liquidation price.
+    pub liquidation_price: String,
+    /// Bankruptcy price when reported.
+    pub bankruptcy_price: Option<String>,
+    /// Maintenance margin required when reported.
+    pub maintenance_margin_required: Option<String>,
+    /// Closeout margin required when reported.
+    pub closeout_margin_required: Option<String>,
+    /// Snapshot timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
 /// Generic Lighter API response wrapper.
 ///
 /// The Lighter API typically wraps responses with a success flag and optional error information.
@@ -295,6 +363,15 @@ pub type TradesResponse = LighterResponse<LighterList<TradeResponse>>;
 
 /// Convenience type alias for orders list response.
 pub type OrdersResponse = LighterResponse<LighterList<OrderResponse>>;
+
+/// Convenience type alias for funding history response.
+pub type FundingHistoryResponse = LighterResponse<LighterList<FundingHistoryEntry>>;
+
+/// Convenience type alias for margin-ratio risk input response.
+pub type MarginRiskResponse = LighterResponse<MarginRatioResponse>;
+
+/// Convenience type alias for liquidation-threshold risk input response.
+pub type LiquidationRiskResponse = LighterResponse<LiquidationThresholdResponse>;
 
 // ================================================================================================
 // Transaction Request Types

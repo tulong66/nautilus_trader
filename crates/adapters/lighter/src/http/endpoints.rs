@@ -71,6 +71,29 @@ pub const CANDLESTICKS: &str = "/api/v1/candlesticks";
 /// **Response**: 24h price statistics including high, low, volume, price change.
 pub const TICKER: &str = "/api/v1/ticker";
 
+/// Get funding history for a market.
+///
+/// **HTTP Method**: GET
+///
+/// **Query Parameters**: `order_book_id` / `market_index`, optional time filters
+///
+/// **Response**: Historical funding-rate observations for read-only risk inputs.
+pub const FUNDING_HISTORY: &str = "/api/v1/funding_history";
+
+/// Get margin-ratio risk inputs for an account or account/market pair.
+///
+/// **HTTP Method**: GET
+///
+/// **Response**: IMR/MMR/CMR and current margin-fraction inputs. Read-only parser surface only.
+pub const MARGIN_RATIOS: &str = "/api/v1/margin_ratios";
+
+/// Get liquidation-threshold risk inputs for a position.
+///
+/// **HTTP Method**: GET
+///
+/// **Response**: Liquidation price/threshold inputs. Read-only parser surface only.
+pub const LIQUIDATION_THRESHOLDS: &str = "/api/v1/liquidation_thresholds";
+
 // ================================================================================================
 // Private (Authenticated) Endpoints
 // ================================================================================================
@@ -184,6 +207,9 @@ mod tests {
         assert_eq!(ORDER_BOOK_DETAILS, "/api/v1/order_book_details");
         assert_eq!(RECENT_TRADES, "/api/v1/recent_trades");
         assert_eq!(CANDLESTICKS, "/api/v1/candlesticks");
+        assert_eq!(FUNDING_HISTORY, "/api/v1/funding_history");
+        assert_eq!(MARGIN_RATIOS, "/api/v1/margin_ratios");
+        assert_eq!(LIQUIDATION_THRESHOLDS, "/api/v1/liquidation_thresholds");
 
         // Private endpoints
         assert_eq!(ACCOUNT, "/api/v1/account");

@@ -16,8 +16,10 @@
 //! Parsing functions for Lighter DEX HTTP API responses.
 
 use super::types::{
-    AccountResponse, LighterList, LighterResponse, MarketsResponse, OrderResponse,
-    OrderbookResponse, OrdersResponse, TickerResponse, TradesResponse,
+    AccountResponse, FundingHistoryEntry, FundingHistoryResponse, LighterList, LighterResponse,
+    LiquidationRiskResponse, LiquidationThresholdResponse, MarginRatioResponse, MarginRiskResponse,
+    MarketsResponse, OrderResponse, OrderbookResponse, OrdersResponse, TickerResponse,
+    TradesResponse,
 };
 use crate::error::LighterError;
 
@@ -69,9 +71,7 @@ pub fn parse_trades_response(data: &[u8]) -> Result<TradesResponse, LighterError
 /// Returns an error if:
 /// - Deserialization fails
 /// - The response indicates an API error
-pub fn parse_ticker_response(
-    data: &[u8],
-) -> Result<LighterResponse<TickerResponse>, LighterError> {
+pub fn parse_ticker_response(data: &[u8]) -> Result<LighterResponse<TickerResponse>, LighterError> {
     let response = serde_json::from_slice::<LighterResponse<TickerResponse>>(data)?;
     validate_response(&response)?;
     Ok(response)
@@ -99,9 +99,7 @@ pub fn parse_account_response(
 /// Returns an error if:
 /// - Deserialization fails
 /// - The response indicates an API error
-pub fn parse_order_response(
-    data: &[u8],
-) -> Result<LighterResponse<OrderResponse>, LighterError> {
+pub fn parse_order_response(data: &[u8]) -> Result<LighterResponse<OrderResponse>, LighterError> {
     let response = serde_json::from_slice::<LighterResponse<OrderResponse>>(data)?;
     validate_response(&response)?;
     Ok(response)
@@ -120,6 +118,55 @@ pub fn parse_orders_response(data: &[u8]) -> Result<OrdersResponse, LighterError
     Ok(response)
 }
 
+/// Parses read-only funding history risk inputs from raw JSON bytes.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails, the response indicates an API error, or numeric
+/// string fields contain non-finite / invalid decimal values.
+pub fn parse_funding_history_response(data: &[u8]) -> Result<FundingHistoryResponse, LighterError> {
+    let response = serde_json::from_slice::<FundingHistoryResponse>(data)?;
+    validate_response(&response)?;
+    if let Some(data) = &response.data {
+        for item in &data.items {
+            validate_funding_history_entry(item)?;
+        }
+    }
+    Ok(response)
+}
+
+/// Parses read-only margin-ratio risk inputs from raw JSON bytes.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails, the response indicates an API error, or numeric
+/// string fields contain non-finite / invalid decimal values.
+pub fn parse_margin_ratio_response(data: &[u8]) -> Result<MarginRiskResponse, LighterError> {
+    let response = serde_json::from_slice::<MarginRiskResponse>(data)?;
+    validate_response(&response)?;
+    if let Some(data) = &response.data {
+        validate_margin_ratio_response(data)?;
+    }
+    Ok(response)
+}
+
+/// Parses read-only liquidation threshold risk inputs from raw JSON bytes.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails, the response indicates an API error, or numeric
+/// string fields contain non-finite / invalid decimal values.
+pub fn parse_liquidation_threshold_response(
+    data: &[u8],
+) -> Result<LiquidationRiskResponse, LighterError> {
+    let response = serde_json::from_slice::<LiquidationRiskResponse>(data)?;
+    validate_response(&response)?;
+    if let Some(data) = &response.data {
+        validate_liquidation_threshold_response(data)?;
+    }
+    Ok(response)
+}
+
 /// Validates that a Lighter response indicates success.
 ///
 /// # Errors
@@ -133,6 +180,59 @@ fn validate_response<T>(response: &LighterResponse<T>) -> Result<(), LighterErro
             .map(|s| s.as_str())
             .unwrap_or("Unknown error");
         return Err(LighterError::Http(error_msg.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_funding_history_entry(item: &FundingHistoryEntry) -> Result<(), LighterError> {
+    validate_decimal_string("fundingRate", &item.funding_rate)?;
+    validate_optional_decimal_string("premiumIndex", item.premium_index.as_deref())?;
+    validate_optional_decimal_string("oraclePrice", item.oracle_price.as_deref())?;
+    validate_optional_decimal_string("markPrice", item.mark_price.as_deref())?;
+    Ok(())
+}
+
+fn validate_margin_ratio_response(item: &MarginRatioResponse) -> Result<(), LighterError> {
+    validate_decimal_string("initialMarginRatio", &item.initial_margin_ratio)?;
+    validate_decimal_string("maintenanceMarginRatio", &item.maintenance_margin_ratio)?;
+    validate_decimal_string("closeoutMarginRatio", &item.closeout_margin_ratio)?;
+    validate_optional_decimal_string("marginFraction", item.margin_fraction.as_deref())?;
+    validate_optional_decimal_string("totalCollateral", item.total_collateral.as_deref())?;
+    validate_optional_decimal_string("positionNotional", item.position_notional.as_deref())?;
+    Ok(())
+}
+
+fn validate_liquidation_threshold_response(
+    item: &LiquidationThresholdResponse,
+) -> Result<(), LighterError> {
+    validate_decimal_string("liquidationPrice", &item.liquidation_price)?;
+    validate_optional_decimal_string("bankruptcyPrice", item.bankruptcy_price.as_deref())?;
+    validate_optional_decimal_string(
+        "maintenanceMarginRequired",
+        item.maintenance_margin_required.as_deref(),
+    )?;
+    validate_optional_decimal_string(
+        "closeoutMarginRequired",
+        item.closeout_margin_required.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn validate_optional_decimal_string(field: &str, value: Option<&str>) -> Result<(), LighterError> {
+    if let Some(value) = value {
+        validate_decimal_string(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_decimal_string(field: &str, value: &str) -> Result<(), LighterError> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| LighterError::Parse(format!("Invalid decimal string for {field}: {value}")))?;
+    if !parsed.is_finite() {
+        return Err(LighterError::Parse(format!(
+            "Invalid non-finite decimal string for {field}: {value}"
+        )));
     }
     Ok(())
 }
@@ -377,6 +477,142 @@ mod tests {
         assert_eq!(account.account_index, 123456);
         assert_eq!(account.balances.len(), 2);
         assert_eq!(account.positions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_funding_history_response_success() {
+        let json = r#"{
+            "success": true,
+            "data": {
+                "items": [
+                    {
+                        "marketIndex": 1,
+                        "fundingRate": "0.000125",
+                        "premiumIndex": "0.000031",
+                        "oraclePrice": "43000.50",
+                        "markPrice": "43005.25",
+                        "timestamp": 1703001600000
+                    },
+                    {
+                        "marketIndex": 1,
+                        "fundingRate": "-0.000075",
+                        "premiumIndex": "-0.000010",
+                        "oraclePrice": "42990.00",
+                        "markPrice": "42988.50",
+                        "timestamp": 1703005200000
+                    }
+                ]
+            }
+        }"#;
+
+        let response = parse_funding_history_response(json.as_bytes()).unwrap();
+        let items = response.data.unwrap().items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].market_index, 1);
+        assert_eq!(items[0].funding_rate, "0.000125");
+        assert_eq!(items[1].funding_rate, "-0.000075");
+    }
+
+    #[test]
+    fn test_parse_funding_history_response_empty_list_is_deterministic() {
+        let json = r#"{
+            "success": true,
+            "data": { "items": [] }
+        }"#;
+
+        let response = parse_funding_history_response(json.as_bytes()).unwrap();
+        assert!(response.data.unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_margin_ratio_response_success() {
+        let json = r#"{
+            "success": true,
+            "data": {
+                "accountIndex": 878,
+                "marketIndex": 1,
+                "initialMarginRatio": "0.1000",
+                "maintenanceMarginRatio": "0.0500",
+                "closeoutMarginRatio": "0.0250",
+                "marginFraction": "0.3125",
+                "totalCollateral": "150000.00",
+                "positionNotional": "48000.00",
+                "timestamp": 1703001600000
+            }
+        }"#;
+
+        let response = parse_margin_ratio_response(json.as_bytes()).unwrap();
+        let risk = response.data.unwrap();
+        assert_eq!(risk.account_index, 878);
+        assert_eq!(risk.market_index, Some(1));
+        assert_eq!(risk.initial_margin_ratio, "0.1000");
+        assert_eq!(risk.maintenance_margin_ratio, "0.0500");
+        assert_eq!(risk.closeout_margin_ratio, "0.0250");
+    }
+
+    #[test]
+    fn test_parse_liquidation_threshold_response_success() {
+        let json = r#"{
+            "success": true,
+            "data": {
+                "accountIndex": 878,
+                "marketIndex": 1,
+                "liquidationPrice": "37500.25",
+                "bankruptcyPrice": "35000.00",
+                "maintenanceMarginRequired": "2400.00",
+                "closeoutMarginRequired": "1200.00",
+                "timestamp": 1703001600000
+            }
+        }"#;
+
+        let response = parse_liquidation_threshold_response(json.as_bytes()).unwrap();
+        let threshold = response.data.unwrap();
+        assert_eq!(threshold.account_index, 878);
+        assert_eq!(threshold.market_index, 1);
+        assert_eq!(threshold.liquidation_price, "37500.25");
+        assert_eq!(threshold.bankruptcy_price, Some("35000.00".to_string()));
+    }
+
+    #[test]
+    fn test_parse_risk_input_missing_required_field_errors() {
+        let json = r#"{
+            "success": true,
+            "data": {
+                "accountIndex": 878,
+                "marketIndex": 1,
+                "maintenanceMarginRatio": "0.0500",
+                "closeoutMarginRatio": "0.0250",
+                "marginFraction": "0.3125",
+                "totalCollateral": "150000.00",
+                "positionNotional": "48000.00",
+                "timestamp": 1703001600000
+            }
+        }"#;
+
+        let result = parse_margin_ratio_response(json.as_bytes());
+        assert!(matches!(result, Err(LighterError::Parse(_))));
+    }
+
+    #[test]
+    fn test_parse_risk_input_invalid_number_errors() {
+        let json = r#"{
+            "success": true,
+            "data": {
+                "items": [
+                    {
+                        "marketIndex": 1,
+                        "fundingRate": "not-a-number",
+                        "premiumIndex": "0.000031",
+                        "oraclePrice": "43000.50",
+                        "markPrice": "43005.25",
+                        "timestamp": 1703001600000
+                    }
+                ]
+            }
+        }"#;
+
+        let result = parse_funding_history_response(json.as_bytes());
+        assert!(matches!(result, Err(LighterError::Parse(_))));
     }
 
     #[test]
