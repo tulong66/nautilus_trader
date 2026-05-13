@@ -73,7 +73,7 @@ Post-P3 safety-reviewed live-prep
 | P3-B | Operator audit summary | [ ] | P3-A | Deterministic audit output summarizes order lifecycle, fills, positions, account timestamps, report consistency, duplicates, stale events, and unresolved anomalies |
 | P3-C | Failure scenario replay pack | [ ] | P3-A | Replay scenarios cover disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, HTTP report error, retry exhaustion, and sequencer non-filled states |
 | P3-D | Paper accounting consistency checks | [ ] | P3-A/P3-B | Replay verifies fills/positions/account/report snapshots remain internally consistent and records clear mismatch diagnostics |
-| P3-E | Safety review entry criteria | [ ] | P3-B/P3-C/P3-D | Documentation defines what evidence is required before any future testnet/private credential design may start; does not approve live work |
+| P3-E | Safety review entry criteria | [x] | P3-B/P3-C/P3-D | `safety-review-entry.zh-CN.md` defines what evidence is required before any future testnet/private credential design may start; does not approve live work |
 | P3-F | P3 verification and docs | [ ] | P3-A-E | Full Rust tests, Python feature check, Python smoke when available, safety searches, and docs/status updates pass |
 
 ## Suggested execution workflow
