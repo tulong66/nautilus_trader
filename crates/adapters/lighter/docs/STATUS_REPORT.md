@@ -78,10 +78,18 @@
 - fail-fast 路径：`Auth`、`Config`、`Signing`、`Parse`、`OrderRejected`、输入/业务拒绝、以及任何未明确归类为 transient 的错误；这些路径不消耗 retry budget，也不会掩盖认证缺失或真实资金风险拒绝。
 - timeout 由 retry policy 的 operation timeout 统一转换为 `LighterError::Timeout`，并按 retry budget 限制最大尝试次数。
 
-### P3 — 延后研究/增强
+### P3 — Paper/replay integration
 
+> 当前 P3 仍严格保持 paper/replay-only；不授权真实凭证、真实 private WS、真实下单/撤单或任何真实资金路径。
+
+- [x] P3-A Paper/replay integration harness：已新增本地 fixture-backed scenario runner，复用 dispatch、reconciliation、reports/mass status；scenario validation 会在执行前拒绝真实 endpoint、credential/keyring/KMS/private-key 等引用。
+- [x] P3-B Operator audit summary：已新增确定性 audit summary 与文本 formatter，覆盖订单生命周期计数、report consistency、account timestamp、duplicate/stale events 与 unresolved anomalies。
+- [ ] P3-C Failure scenario replay pack：待后续任务补齐 disconnect/resubscribe、HTTP report error、retry exhaustion、sequencer non-filled 等完整 failure pack。
+- [ ] P3-D Paper accounting consistency checks：待后续任务补齐 fills/positions/account/report accounting mismatch 细粒度一致性检查。
+- [ ] P3-E Safety review entry criteria：待后续任务补齐未来 testnet/private credential 设计前的安全审查入口标准。
+- [ ] P3-F P3 verification and docs：待 P3-C/D/E 完成后统一收尾验证。
 - [ ] maker-vs-taking / quote skew 研究仅在 signal-driven execution 明确需要后推进。
-- [ ] 真实 testnet/private credential 流程只在 J-R 全部完成并人工批准后另起安全审计任务。
+- [ ] 真实 testnet/private credential 流程只在 P3 完成并人工批准后另起安全审计任务。
 
 ---
 

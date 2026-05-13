@@ -26,14 +26,14 @@ P3 MVP proves that deterministic paper/replay workflows can consume Lighter adap
 
 ## Implementation tasks
 
-- [ ] P3-A. Add paper/replay integration harness
+- [x] P3-A. Add paper/replay integration harness
   - Create deterministic scenario model and runner using local fixtures/mock inputs only.
   - Cover happy-path order/account/fill/report replay.
   - Reject real endpoint or credential references during scenario validation.
   - Use TDD: write failing harness test first, confirm RED, then implement.
   - _Requirements: US-1_
 
-- [ ] P3-B. Add operator audit summary
+- [x] P3-B. Add operator audit summary
   - Add stable audit data structure and formatter for replay results.
   - Include lifecycle counts, account timestamps, report consistency, duplicates, stale events, and unresolved anomalies.
   - Use TDD with a deterministic audit snapshot/assertion.
