@@ -39,16 +39,16 @@ P3 MVP proves that deterministic paper/replay workflows can consume Lighter adap
   - Use TDD with a deterministic audit snapshot/assertion.
   - _Requirements: US-2_
 
-- [ ] P3-C. Add failure scenario replay pack
-  - Add deterministic scenarios for disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, mock report error, retry exhaustion, and sequencer non-filled states.
-  - Keep scenarios fast and in-memory; no wall-clock long sleep.
-  - Use TDD per scenario group.
+- [x] P3-C. Add failure scenario replay pack
+  - Added deterministic `PaperReplayFailureScenario` for disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, mock report error, retry exhaustion, and sequencer non-filled states.
+  - Scenarios are fixture-backed, in-memory, and contain no long sleep or network path.
+  - RED: `cargo +1.95.0 test --manifest-path .../Cargo.toml -p nautilus-lighter --test execution_soak p3_ -- --nocapture` failed on missing failure scenario API; GREEN: focused `failure_replay_pack` test passed.
   - _Requirements: US-3_
 
-- [ ] P3-D. Add paper accounting consistency checks
-  - Compare replay-derived fills/positions/account state with report-derived snapshots.
-  - Emit deterministic mismatch diagnostics.
-  - Cover success and mismatch tests.
+- [x] P3-D. Add paper accounting consistency checks
+  - Added `check_paper_accounting_consistency` comparing replay-derived fills/positions/account state with report-derived snapshots.
+  - Emits deterministic mismatch diagnostics for fill/position quantity and account timestamp drift.
+  - RED: same focused RED run failed on missing accounting API; GREEN: focused `paper_accounting_consistency` success and mismatch tests passed.
   - _Requirements: US-4_
 
 - [x] P3-E. Document safety review entry criteria

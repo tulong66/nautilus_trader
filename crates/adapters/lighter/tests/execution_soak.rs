@@ -19,8 +19,9 @@ use nautilus_lighter::{
         fixtures::execution_fixture_set,
         reconciliation::ReconciledOrderStatus,
         replay::{
-            PaperReplayReportSnapshot, PaperReplayScenario, PaperReplaySoakConfig,
-            PaperReplaySoakExperiment, run_paper_replay_scenario, run_paper_replay_soak,
+            PaperReplayFailureScenario, PaperReplayReportSnapshot, PaperReplayScenario,
+            PaperReplaySoakConfig, PaperReplaySoakExperiment, check_paper_accounting_consistency,
+            run_paper_replay_failure_scenario, run_paper_replay_scenario, run_paper_replay_soak,
         },
     },
 };
@@ -195,5 +196,109 @@ fn operator_audit_identifies_report_count_mismatches() {
         audit
             .render_text()
             .contains("unresolved_anomalies=report_mismatch")
+    );
+}
+#[test]
+fn failure_replay_pack_covers_retry_exhaustion_empty_snapshots_stale_duplicates_and_non_filled_sequencer_states()
+ {
+    let fixtures = execution_fixture_set();
+    let scenario = PaperReplayFailureScenario::fixture_backed(
+        "p3-c-failure-pack",
+        fixtures.clone(),
+        fixture_client_id(),
+        fixture_account_id(),
+        *LIGHTER_VENUE,
+        fixture_instrument_id(),
+    )
+    .with_retry_exhaustion("mock-report", 3)
+    .with_mock_report_error("mock report error: unavailable");
+
+    let result =
+        run_paper_replay_failure_scenario(&scenario).expect("failure replay scenario result");
+
+    assert_eq!(result.scenario_name, "p3-c-failure-pack");
+    assert_eq!(result.disconnects, 1);
+    assert_eq!(result.resubscriptions, 1);
+    assert!(result.duplicate_events >= fixtures.orders.len());
+    assert_eq!(result.stale_events, 2);
+    assert_eq!(result.empty_account_updates, 1);
+    assert_eq!(result.empty_order_snapshots, 1);
+    assert_eq!(
+        result.retry_exhausted.as_deref(),
+        Some("mock-report attempts=3")
+    );
+    assert_eq!(
+        result.mock_report_error.as_deref(),
+        Some("mock report error: unavailable")
+    );
+    assert_eq!(
+        result.non_filled_sequencer_states,
+        vec!["submitted", "accepted", "pending", "timeout"]
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|line| line == "sequencer_non_filled status=pending")
+    );
+}
+
+#[test]
+fn paper_accounting_consistency_matches_replay_state_to_report_snapshot() {
+    let fixtures = execution_fixture_set();
+    let scenario = PaperReplayScenario::fixture_backed(
+        "p3-d-accounting-success",
+        fixtures.clone(),
+        fixture_client_id(),
+        fixture_account_id(),
+        *LIGHTER_VENUE,
+        fixture_instrument_id(),
+    );
+
+    let consistency =
+        check_paper_accounting_consistency(&scenario).expect("paper accounting consistency");
+
+    assert!(consistency.consistent);
+    assert!(consistency.diagnostics.is_empty());
+    assert_eq!(consistency.replay_fills, 1);
+    assert_eq!(consistency.report_fills, 1);
+    assert_eq!(consistency.replay_positions, 1);
+    assert_eq!(consistency.report_positions, 1);
+    assert_eq!(
+        consistency.replay_account_timestamp,
+        Some(fixtures.account.timestamp_ms)
+    );
+    assert_eq!(
+        consistency.report_account_timestamp,
+        Some(fixtures.account.timestamp_ms)
+    );
+}
+
+#[test]
+fn paper_accounting_consistency_reports_deterministic_mismatch_diagnostics() {
+    let mut fixtures = execution_fixture_set();
+    fixtures.fill.quantity = "0.1250".to_string();
+    fixtures.position.size = "0.2500".to_string();
+    fixtures.account.timestamp_ms += 5;
+    let scenario = PaperReplayScenario::fixture_backed(
+        "p3-d-accounting-mismatch",
+        fixtures,
+        fixture_client_id(),
+        fixture_account_id(),
+        *LIGHTER_VENUE,
+        fixture_instrument_id(),
+    )
+    .with_report_account_timestamp_ms(1_700_000_001_500);
+
+    let consistency =
+        check_paper_accounting_consistency(&scenario).expect("paper accounting consistency");
+
+    assert!(!consistency.consistent);
+    assert_eq!(
+        consistency.diagnostics,
+        vec![
+            "fill_position_quantity_mismatch replay_fills=0.1250 report_position_size=0.2500".to_string(),
+            "account_timestamp_mismatch replay_account_timestamp=1700000000105 report_account_timestamp=1700000001500".to_string(),
+        ]
     );
 }

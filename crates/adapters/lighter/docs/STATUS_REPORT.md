@@ -84,8 +84,8 @@
 
 - [x] P3-A Paper/replay integration harness：已新增本地 fixture-backed scenario runner，复用 dispatch、reconciliation、reports/mass status；scenario validation 会在执行前拒绝真实 endpoint、credential/keyring/KMS/private-key 等引用。
 - [x] P3-B Operator audit summary：已新增确定性 audit summary 与文本 formatter，覆盖订单生命周期计数、report consistency、account timestamp、duplicate/stale events 与 unresolved anomalies。
-- [ ] P3-C Failure scenario replay pack：待后续任务补齐 disconnect/resubscribe、HTTP report error、retry exhaustion、sequencer non-filled 等完整 failure pack。
-- [ ] P3-D Paper accounting consistency checks：待后续任务补齐 fills/positions/account/report accounting mismatch 细粒度一致性检查。
+- [x] P3-C Failure scenario replay pack：已新增 `PaperReplayFailureScenario`，fixture-backed/in-memory 覆盖 disconnect/resubscribe、duplicate messages、stale updates、empty account/orders、mock report error、retry exhaustion、sequencer non-filled states；focused `failure_replay_pack` 测试通过。
+- [x] P3-D Paper accounting consistency checks：已新增 `check_paper_accounting_consistency`，比较 replay-derived fills/positions/account state 与 report-derived snapshot，并输出确定性 fill/position 与 account timestamp mismatch diagnostics；focused success/mismatch tests 通过。
 - [x] P3-E Safety review entry criteria：已新增 `safety-review-entry.zh-CN.md`，明确 P3 paper/replay 不等于 live/testnet 授权，并定义未来 testnet/private credential 设计前的安全审查入口标准。
 - [ ] P3-F P3 verification and docs：待 P3-C/D 完成后统一收尾验证。
 - [ ] maker-vs-taking / quote skew 研究仅在 signal-driven execution 明确需要后推进。

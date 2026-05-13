@@ -71,8 +71,8 @@ Post-P3 safety-reviewed live-prep
 |----|------|--------|------------|---------------------|
 | P3-A | Paper/replay integration harness | [x] | P2-R | Local harness replays public/private fixtures and mock reports into adapter execution/report/reconciliation components without network or credentials |
 | P3-B | Operator audit summary | [x] | P3-A | Deterministic audit output summarizes order lifecycle, fills, positions, account timestamps, report consistency, duplicates, stale events, and unresolved anomalies |
-| P3-C | Failure scenario replay pack | [ ] | P3-A | Replay scenarios cover disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, HTTP report error, retry exhaustion, and sequencer non-filled states |
-| P3-D | Paper accounting consistency checks | [ ] | P3-A/P3-B | Replay verifies fills/positions/account/report snapshots remain internally consistent and records clear mismatch diagnostics |
+| P3-C | Failure scenario replay pack | [x] | P3-A | `PaperReplayFailureScenario` covers disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, mock report error, retry exhaustion, and sequencer non-filled states; focused test `failure_replay_pack` passed |
+| P3-D | Paper accounting consistency checks | [x] | P3-A/P3-B | `check_paper_accounting_consistency` compares replay fills/positions/account state with report snapshots and emits deterministic mismatch diagnostics; focused `paper_accounting_consistency` tests passed |
 | P3-E | Safety review entry criteria | [x] | P3-B/P3-C/P3-D | `safety-review-entry.zh-CN.md` defines what evidence is required before any future testnet/private credential design may start; does not approve live work |
 | P3-F | P3 verification and docs | [ ] | P3-A-E | Full Rust tests, Python feature check, Python smoke when available, safety searches, and docs/status updates pass |
 

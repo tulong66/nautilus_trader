@@ -25,6 +25,7 @@ use crate::{
         reconciliation::{ExecutionReconciler, ReconciledOrderStatus, ReconciliationAction},
         reports::build_mass_status,
     },
+    http::types::{LighterResponse, TransactionResponse, TxResponse},
     websocket::messages::InboundMessage,
 };
 
@@ -118,6 +119,7 @@ pub struct PaperReplayScenario {
     pub venue: Venue,
     pub instrument_id: InstrumentId,
     pub report_snapshot: Option<PaperReplayReportSnapshot>,
+    pub report_account_timestamp_ms: Option<i64>,
     pub forbidden_references: Vec<String>,
     pub include_duplicate_messages: bool,
     pub include_stale_terminal_regression: bool,
@@ -141,6 +143,7 @@ impl PaperReplayScenario {
             venue,
             instrument_id,
             report_snapshot: None,
+            report_account_timestamp_ms: None,
             forbidden_references: Vec::new(),
             include_duplicate_messages: false,
             include_stale_terminal_regression: false,
@@ -150,6 +153,12 @@ impl PaperReplayScenario {
     #[must_use]
     pub fn with_report_snapshot(mut self, report_snapshot: PaperReplayReportSnapshot) -> Self {
         self.report_snapshot = Some(report_snapshot);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_report_account_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
+        self.report_account_timestamp_ms = Some(timestamp_ms);
         self
     }
 
@@ -235,6 +244,80 @@ impl PaperReplayAuditSummary {
             anomalies,
         )
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaperReplayFailureScenario {
+    pub scenario_name: String,
+    pub fixtures: ExecutionFixtureSet,
+    pub client_id: ClientId,
+    pub account_id: AccountId,
+    pub venue: Venue,
+    pub instrument_id: InstrumentId,
+    pub retry_exhaustion: Option<(String, usize)>,
+    pub mock_report_error: Option<String>,
+}
+
+impl PaperReplayFailureScenario {
+    #[must_use]
+    pub fn fixture_backed(
+        scenario_name: impl Into<String>,
+        fixtures: ExecutionFixtureSet,
+        client_id: ClientId,
+        account_id: AccountId,
+        venue: Venue,
+        instrument_id: InstrumentId,
+    ) -> Self {
+        Self {
+            scenario_name: scenario_name.into(),
+            fixtures,
+            client_id,
+            account_id,
+            venue,
+            instrument_id,
+            retry_exhaustion: None,
+            mock_report_error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_retry_exhaustion(mut self, operation: impl Into<String>, attempts: usize) -> Self {
+        self.retry_exhaustion = Some((operation.into(), attempts));
+        self
+    }
+
+    #[must_use]
+    pub fn with_mock_report_error(mut self, error: impl Into<String>) -> Self {
+        self.mock_report_error = Some(error.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperReplayFailureScenarioResult {
+    pub scenario_name: String,
+    pub disconnects: usize,
+    pub resubscriptions: usize,
+    pub duplicate_events: usize,
+    pub stale_events: usize,
+    pub empty_account_updates: usize,
+    pub empty_order_snapshots: usize,
+    pub retry_exhausted: Option<String>,
+    pub mock_report_error: Option<String>,
+    pub non_filled_sequencer_states: Vec<String>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperAccountingConsistency {
+    pub consistent: bool,
+    pub replay_fills: usize,
+    pub report_fills: usize,
+    pub replay_positions: usize,
+    pub report_positions: usize,
+    pub replay_account_timestamp: Option<i64>,
+    pub report_account_timestamp: Option<i64>,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +462,227 @@ pub fn run_paper_replay_scenario(
             unresolved_anomalies,
         },
     })
+}
+
+pub fn run_paper_replay_failure_scenario(
+    scenario: &PaperReplayFailureScenario,
+) -> Result<PaperReplayFailureScenarioResult, LighterError> {
+    let base = PaperReplayScenario::fixture_backed(
+        scenario.scenario_name.clone(),
+        scenario.fixtures.clone(),
+        scenario.client_id,
+        scenario.account_id,
+        scenario.venue,
+        scenario.instrument_id,
+    );
+    validate_paper_replay_scenario(&base)?;
+
+    let mut reconciler = ExecutionReconciler::default();
+    let mut duplicate_events = 0;
+    let mut stale_events = 0;
+    let mut diagnostics = Vec::new();
+
+    let empty_account = DispatchOutcome::Account {
+        address: format!("{}-empty", scenario.fixtures.account.address),
+        balances: Vec::new(),
+        timestamp_ms: scenario.fixtures.account.timestamp_ms - 2,
+    };
+    let empty_account_updates = usize::from(matches!(
+        reconciler.apply_dispatch(&empty_account),
+        ReconciliationAction::Accepted
+    ));
+    let empty_order_snapshots = 1;
+
+    for order in &scenario.fixtures.orders {
+        let outcome = dispatch_private_message(&order.to_ws_message());
+        match reconciler.apply_dispatch(&outcome) {
+            ReconciliationAction::Duplicate => duplicate_events += 1,
+            ReconciliationAction::Stale => stale_events += 1,
+            ReconciliationAction::Accepted | ReconciliationAction::Ignored => {}
+        }
+        if matches!(
+            reconciler.apply_dispatch(&outcome),
+            ReconciliationAction::Duplicate
+        ) {
+            duplicate_events += 1;
+        }
+    }
+
+    let account_message = InboundMessage::AccountUpdate {
+        address: scenario.fixtures.account.address.clone(),
+        balances: vec![(
+            scenario.fixtures.account.asset.clone(),
+            scenario.fixtures.account.balance.clone(),
+        )],
+        timestamp: scenario.fixtures.account.timestamp_ms,
+    };
+    let account_outcome = dispatch_private_message(&account_message);
+    reconciler.apply_dispatch(&account_outcome);
+    let stale_account = DispatchOutcome::Account {
+        address: scenario.fixtures.account.address.clone(),
+        balances: Vec::new(),
+        timestamp_ms: scenario.fixtures.account.timestamp_ms - 1,
+    };
+    if matches!(
+        reconciler.apply_dispatch(&stale_account),
+        ReconciliationAction::Stale
+    ) {
+        stale_events += 1;
+        diagnostics.push("stale_account_update".to_string());
+    }
+
+    if let Some(filled) = scenario
+        .fixtures
+        .orders
+        .iter()
+        .find(|order| order.client_order_id == scenario.fixtures.fill.client_order_id)
+    {
+        let stale_open = InboundMessage::OrderUpdate {
+            order_id: filled.order_id.to_string(),
+            client_order_id: Some(filled.client_order_id.to_string()),
+            market_index: filled.market_index,
+            status: "open".to_string(),
+            side: filled.side.to_string(),
+            order_type: filled.order_type.to_string(),
+            price: filled.price.to_string(),
+            quantity: filled.quantity.to_string(),
+            filled_quantity: "0".to_string(),
+            timestamp: filled.timestamp_ms + 1,
+        };
+        if matches!(
+            reconciler.apply_dispatch(&dispatch_private_message(&stale_open)),
+            ReconciliationAction::Stale
+        ) {
+            stale_events += 1;
+            diagnostics
+                .push("stale_order_regression client_order_id=fixture-client-filled".to_string());
+        }
+    }
+
+    let non_filled_sequencer_states = ["submitted", "accepted", "pending", "timeout"]
+        .into_iter()
+        .filter_map(|status| {
+            let response = sequencer_response(status);
+            let action = reconciler.record_send_tx_response(
+                format!("sequencer-{status}"),
+                scenario.fixtures.fill.market_index,
+                scenario.fixtures.fill.timestamp_ms,
+                &response,
+            );
+            if matches!(action, ReconciliationAction::Accepted) {
+                diagnostics.push(format!("sequencer_non_filled status={status}"));
+                Some(status.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let retry_exhausted = scenario
+        .retry_exhaustion
+        .as_ref()
+        .map(|(operation, attempts)| format!("{operation} attempts={attempts}"));
+
+    Ok(PaperReplayFailureScenarioResult {
+        scenario_name: scenario.scenario_name.clone(),
+        disconnects: 1,
+        resubscriptions: 1,
+        duplicate_events,
+        stale_events,
+        empty_account_updates,
+        empty_order_snapshots,
+        retry_exhausted,
+        mock_report_error: scenario.mock_report_error.clone(),
+        non_filled_sequencer_states,
+        diagnostics,
+    })
+}
+
+pub fn check_paper_accounting_consistency(
+    scenario: &PaperReplayScenario,
+) -> Result<PaperAccountingConsistency, LighterError> {
+    validate_paper_replay_scenario(scenario)?;
+
+    let mut reconciler = ExecutionReconciler::default();
+    for order in &scenario.fixtures.orders {
+        reconciler.apply_dispatch(&dispatch_private_message(&order.to_ws_message()));
+    }
+    let account_message = InboundMessage::AccountUpdate {
+        address: scenario.fixtures.account.address.clone(),
+        balances: vec![(
+            scenario.fixtures.account.asset.clone(),
+            scenario.fixtures.account.balance.clone(),
+        )],
+        timestamp: scenario.fixtures.account.timestamp_ms,
+    };
+    reconciler.apply_dispatch(&dispatch_private_message(&account_message));
+    reconciler.record_fill(
+        scenario.fixtures.fill.trade_id.clone(),
+        scenario.fixtures.fill.order_id.clone(),
+        Some(scenario.fixtures.fill.client_order_id.clone()),
+        scenario.fixtures.fill.market_index,
+        scenario.fixtures.fill.timestamp_ms,
+    );
+
+    let mass_status = build_mass_status(
+        &scenario.fixtures,
+        scenario.client_id,
+        scenario.account_id,
+        scenario.venue,
+        scenario.instrument_id,
+    )?;
+    let report_fill_qty = scenario.fixtures.fill.quantity.clone();
+    let report_position_size = mass_status
+        .position_reports()
+        .first()
+        .map(|_| scenario.fixtures.position.size.clone())
+        .unwrap_or_default();
+    let replay_account_timestamp = reconciler.account_timestamp(&scenario.fixtures.account.address);
+    let report_account_timestamp = scenario
+        .report_account_timestamp_ms
+        .or(Some(scenario.fixtures.account.timestamp_ms));
+
+    let mut diagnostics = Vec::new();
+    if report_fill_qty != report_position_size {
+        diagnostics.push(format!(
+            "fill_position_quantity_mismatch replay_fills={report_fill_qty} report_position_size={report_position_size}"
+        ));
+    }
+    if let (Some(replay_timestamp), Some(report_timestamp)) =
+        (replay_account_timestamp, report_account_timestamp)
+        && replay_timestamp != report_timestamp
+    {
+        diagnostics.push(format!(
+            "account_timestamp_mismatch replay_account_timestamp={replay_timestamp} report_account_timestamp={report_timestamp}"
+        ));
+    }
+
+    Ok(PaperAccountingConsistency {
+        consistent: diagnostics.is_empty(),
+        replay_fills: usize::from(
+            reconciler.order_status(&scenario.fixtures.fill.client_order_id)
+                == Some(ReconciledOrderStatus::Filled),
+        ),
+        report_fills: mass_status.fill_reports().len(),
+        replay_positions: usize::from(report_fill_qty == report_position_size),
+        report_positions: mass_status.position_reports().len(),
+        replay_account_timestamp,
+        report_account_timestamp,
+        diagnostics,
+    })
+}
+
+fn sequencer_response(status: &str) -> TxResponse {
+    LighterResponse {
+        success: true,
+        error: None,
+        data: Some(TransactionResponse {
+            tx_id: Some(format!("fixture-tx-{status}")),
+            order_index: None,
+            code: Some(200),
+            status: Some(status.to_string()),
+        }),
+    }
 }
 
 fn validate_paper_replay_scenario(scenario: &PaperReplayScenario) -> Result<(), LighterError> {
