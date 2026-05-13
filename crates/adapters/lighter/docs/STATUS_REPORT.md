@@ -1,7 +1,7 @@
 # Lighter DEX Adapter - 开发状态报告
 
-> **最后更新**: 2026-05-12
-> **状态**: ⚠️ Rust 骨架可编译/测试通过；Nautilus Python/Live 接入与执行回报闭环未完成
+> **最后更新**: 2026-05-13
+> **状态**: ✅ P2-R 验证与文档收尾完成；adapter 保持受控 live-prep / paper-replay-ready 状态，未推进真实资金路径
 
 ---
 
@@ -69,7 +69,7 @@
 | O | Latency / retry / rate-limit 模型：整理 Standard 200/300ms latency、超时、重试、退避和限流策略 | [x] | J 后可并行 | 已新增 `http::retry::LighterRetryPolicy`；单元测试覆盖 retry budget、timeout、429/rate-limit backoff、fail-fast 分类；HTTP mock 测试覆盖 429 retry 与 401 auth fail-fast |
 | P | Funding / margin / liquidation 风险输入：解析 funding endpoint/history，并建模 IMR/MMR/CMR/liquidation 前置数据 | [x] | J 后可并行 | 已新增只读 funding history、margin ratio(IMR/MMR/CMR)、liquidation threshold DTO/parser；fixture-backed tests 覆盖 success、empty list、missing field、invalid number；不接入真实账户风险动作 |
 | Q | Paper/replay soak 验证：用录制 public/private fixture 长时间回放，验证 execution/account/report 一致性 | [x] | J 后可并行 | 已新增 `execution::replay` 离线 fixture-backed soak harness 与 `tests/execution_soak.rs`；实验 `fixture:p2-q-fixture-soak;rounds:3;disconnect_reconnect:true;duplicates:true;empty:true;network:none` 覆盖断线重连、订阅恢复、重复消息、空账户/空订单，并校验 execution/account/report 一致性；不认证、不连接真实 private WS |
-| R | Verification + docs：完成下一阶段验证并更新状态报告与 Track B 指针 | [ ] | 依赖 J-Q | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python smoke test 通过；本任务板按实际结果更新 |
+| R | Verification + docs：完成下一阶段验证并更新状态报告与 Track B 指针 | [x] | 依赖 J-Q | 2026-05-13 收尾验证通过：`cargo +1.95.0 test --manifest-path .../Cargo.toml -p nautilus-lighter` 通过（lib 147 passed / 2 ignored，integration suites 43 passed，doctest 1 passed / 3 ignored）；`cargo +1.95.0 check --manifest-path .../Cargo.toml -p nautilus-lighter --features python` 通过；Python import smoke `uv run --project ... --group test pytest .../test_imports.py -q` 通过（3 passed）；安全搜索仅命中环境 URL/只读字段/deny-list 测试/fixture 字段，无新增 secret 读取或真实资金动作路径 |
 
 #### P2-O retry / timeout / rate-limit 策略说明
 
