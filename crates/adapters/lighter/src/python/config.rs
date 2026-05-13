@@ -77,6 +77,9 @@ impl LighterExecClientConfig {
         heartbeat_interval_secs = None,
         http_timeout_secs = None,
         max_retries = None,
+        report_source = None,
+        report_base_url = None,
+        report_page_limit = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -92,6 +95,9 @@ impl LighterExecClientConfig {
         heartbeat_interval_secs: Option<u64>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
+        report_source: Option<String>,
+        report_base_url: Option<String>,
+        report_page_limit: Option<usize>,
     ) -> Self {
         let mut config = Self::new(
             private_key,
@@ -107,6 +113,9 @@ impl LighterExecClientConfig {
         config.heartbeat_interval_secs = heartbeat_interval_secs.or(config.heartbeat_interval_secs);
         config.http_timeout_secs = http_timeout_secs.or(config.http_timeout_secs);
         config.max_retries = max_retries.or(config.max_retries);
+        config.report_source = report_source;
+        config.report_base_url = report_base_url;
+        config.report_page_limit = report_page_limit;
         config
     }
 

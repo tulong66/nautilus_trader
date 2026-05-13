@@ -225,6 +225,12 @@ pub struct LighterExecClientConfig {
     pub http_timeout_secs: Option<u64>,
     /// Maximum retry attempts (default: 3).
     pub max_retries: Option<u32>,
+    /// Report source override for paper/replay testing (for example, `mock_http`).
+    pub report_source: Option<String>,
+    /// Report source HTTP base URL for deterministic mock report servers.
+    pub report_base_url: Option<String>,
+    /// Report source page limit for pagination tests.
+    pub report_page_limit: Option<usize>,
 }
 
 impl LighterExecClientConfig {
@@ -249,6 +255,9 @@ impl LighterExecClientConfig {
             heartbeat_interval_secs: Some(60),
             http_timeout_secs: Some(30),
             max_retries: Some(3),
+            report_source: None,
+            report_base_url: None,
+            report_page_limit: None,
         }
     }
 

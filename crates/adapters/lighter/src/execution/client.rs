@@ -32,13 +32,18 @@ use nautilus_core::{MUTEX_POISONED, Params, UnixNanos};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::OmsType,
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
+    enums::{
+        LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
+        TimeInForce,
+    },
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+use rust_decimal::Decimal;
+use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -137,12 +142,46 @@ impl OfflineReportSource {
 
 const OFFLINE_REPORT_SOURCE_PARAM: &str = "lighter_report_source";
 const OFFLINE_REPORT_SOURCE_VALUE: &str = "fixture";
+const MOCK_HTTP_REPORT_SOURCE_VALUE: &str = "mock_http";
+const MOCK_HTTP_REPORT_BASE_URL_PARAM: &str = "lighter_report_base_url";
+const MOCK_HTTP_REPORT_PAGE_LIMIT_PARAM: &str = "lighter_report_page_limit";
 const OFFLINE_REPORT_INSTRUMENT_ID: &str = "ETH_USDC.LIGHTER";
 const OFFLINE_REPORT_LOOKBACK_MINS: u64 = u64::MAX;
 
 fn is_offline_fixture_report_request(params: Option<&Params>) -> bool {
     params.and_then(|params| params.get_str(OFFLINE_REPORT_SOURCE_PARAM))
         == Some(OFFLINE_REPORT_SOURCE_VALUE)
+}
+
+fn is_mock_http_report_request(params: Option<&Params>) -> bool {
+    params.and_then(|params| params.get_str(OFFLINE_REPORT_SOURCE_PARAM))
+        == Some(MOCK_HTTP_REPORT_SOURCE_VALUE)
+}
+
+fn mock_http_report_params_from_config(config: &LighterExecClientConfig) -> Option<Params> {
+    if config.report_source.as_deref()? != MOCK_HTTP_REPORT_SOURCE_VALUE {
+        return None;
+    }
+
+    let mut params = Params::new();
+    params.insert(
+        OFFLINE_REPORT_SOURCE_PARAM.to_string(),
+        serde_json::Value::String(MOCK_HTTP_REPORT_SOURCE_VALUE.to_string()),
+    );
+    if let Some(base_url) = config.report_base_url.as_ref() {
+        params.insert(
+            MOCK_HTTP_REPORT_BASE_URL_PARAM.to_string(),
+            serde_json::Value::String(base_url.clone()),
+        );
+    }
+    if let Some(page_limit) = config.report_page_limit {
+        params.insert(
+            MOCK_HTTP_REPORT_PAGE_LIMIT_PARAM.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(page_limit)),
+        );
+    }
+
+    Some(params)
 }
 
 fn default_offline_report_source(
@@ -155,6 +194,243 @@ fn default_offline_report_source(
         *LIGHTER_VENUE,
         InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID),
     )
+}
+
+struct MockHttpReportSource {
+    http_client: LighterRawHttpClient,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    page_limit: usize,
+}
+
+impl MockHttpReportSource {
+    fn from_params(
+        params: Option<&Params>,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<Self> {
+        let params = params.ok_or_else(|| anyhow::anyhow!("mock_http report params missing"))?;
+        let base_url = params
+            .get_str(MOCK_HTTP_REPORT_BASE_URL_PARAM)
+            .ok_or_else(|| anyhow::anyhow!("mock_http report base URL missing"))?;
+        let page_limit = params
+            .get_usize(MOCK_HTTP_REPORT_PAGE_LIMIT_PARAM)
+            .unwrap_or(100)
+            .max(1);
+        let http_client = LighterRawHttpClient::with_base_url(base_url, None, Some(5), None, None)
+            .map_err(|e| anyhow::anyhow!("mock_http report client error: {e}"))?;
+
+        Ok(Self {
+            http_client,
+            account_id,
+            instrument_id: instrument_id
+                .unwrap_or_else(|| InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID)),
+            page_limit,
+        })
+    }
+
+    async fn order_status_reports(&self) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let items = self
+            .fetch_paginated_items("/api/v1/account_active_orders")
+            .await?;
+        items
+            .iter()
+            .map(|item| self.order_status_report_from_json(item))
+            .collect()
+    }
+
+    async fn fill_reports(&self) -> anyhow::Result<Vec<FillReport>> {
+        let items = self.fetch_paginated_items("/api/v1/account_fills").await?;
+        items
+            .iter()
+            .map(|item| self.fill_report_from_json(item))
+            .collect()
+    }
+
+    async fn position_status_reports(&self) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let items = self
+            .fetch_paginated_items("/api/v1/account_positions")
+            .await?;
+        items
+            .iter()
+            .map(|item| self.position_status_report_from_json(item))
+            .collect()
+    }
+
+    async fn mass_status(
+        &self,
+        client_id: ClientId,
+        venue: Venue,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        let mut mass_status = ExecutionMassStatus::new(
+            client_id,
+            self.account_id,
+            venue,
+            UnixNanos::default(),
+            None,
+        );
+        mass_status.add_order_reports(self.order_status_reports().await?);
+        mass_status.add_fill_reports(self.fill_reports().await?);
+        mass_status.add_position_reports(self.position_status_reports().await?);
+
+        Ok(Some(mass_status))
+    }
+
+    async fn fetch_paginated_items(&self, endpoint: &str) -> anyhow::Result<Vec<Value>> {
+        let mut cursor: Option<String> = None;
+        let mut items = Vec::new();
+
+        loop {
+            let query = cursor.as_ref().map_or_else(
+                || format!("limit={}", self.page_limit),
+                |cursor| format!("limit={}&cursor={cursor}", self.page_limit),
+            );
+            let response: Value = self
+                .http_client
+                .get(endpoint, Some(query.as_str()))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("mock_http report request failed for {endpoint}: {e}")
+                })?;
+            if response.get("success").and_then(Value::as_bool) != Some(true) {
+                return Err(anyhow::anyhow!(
+                    "mock_http report request failed for {endpoint}: success=false"
+                ));
+            }
+            let data = response.get("data").ok_or_else(|| {
+                anyhow::anyhow!("mock_http report response missing data for {endpoint}")
+            })?;
+            let page_items = data
+                .get("items")
+                .or_else(|| data.get("orders"))
+                .or_else(|| data.get("fills"))
+                .or_else(|| data.get("positions"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mock_http report response missing items for {endpoint}")
+                })?;
+            items.extend(page_items.iter().cloned());
+
+            let next_cursor = data.get("next_cursor").and_then(Value::as_str);
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor.to_string());
+        }
+
+        Ok(items)
+    }
+
+    fn order_status_report_from_json(&self, item: &Value) -> anyhow::Result<OrderStatusReport> {
+        let ts = timestamp_ms_to_ns(required_i64(item, "timestamp")?)?;
+        let status = match required_str(item, "status")? {
+            "open" => OrderStatus::Accepted,
+            "filled" => OrderStatus::Filled,
+            "partially_filled" => OrderStatus::PartiallyFilled,
+            "canceled" => OrderStatus::Canceled,
+            "rejected" => OrderStatus::Rejected,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "mock_http unsupported order status: {other}"
+                ));
+            }
+        };
+        let report = OrderStatusReport::new(
+            self.account_id,
+            self.instrument_id,
+            Some(ClientOrderId::new(required_str(item, "client_order_id")?)),
+            VenueOrderId::new(required_str(item, "order_id")?),
+            order_side_from_str(required_str(item, "side")?)?,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            status,
+            Quantity::from(required_str(item, "quantity")?),
+            Quantity::from(required_str(item, "filled_quantity")?),
+            ts,
+            ts,
+            ts,
+            None,
+        )
+        .with_price(Price::from(required_str(item, "price")?));
+
+        Ok(report)
+    }
+
+    fn fill_report_from_json(&self, item: &Value) -> anyhow::Result<FillReport> {
+        let ts = timestamp_ms_to_ns(required_i64(item, "timestamp")?)?;
+        Ok(FillReport::new(
+            self.account_id,
+            self.instrument_id,
+            VenueOrderId::new(required_str(item, "order_id")?),
+            TradeId::new(required_str(item, "trade_id")?),
+            order_side_from_str(required_str(item, "side")?)?,
+            Quantity::from(required_str(item, "quantity")?),
+            Price::from(required_str(item, "price")?),
+            Money::new(0.0, Currency::USD()),
+            LiquiditySide::NoLiquiditySide,
+            Some(ClientOrderId::new(required_str(item, "client_order_id")?)),
+            None,
+            ts,
+            ts,
+            None,
+        ))
+    }
+
+    fn position_status_report_from_json(
+        &self,
+        item: &Value,
+    ) -> anyhow::Result<PositionStatusReport> {
+        let ts = timestamp_ms_to_ns(required_i64(item, "timestamp")?)?;
+        let quantity = Quantity::from(required_str(item, "size")?);
+        let side = if quantity.is_zero() {
+            PositionSideSpecified::Flat
+        } else {
+            PositionSideSpecified::Long
+        };
+        let avg_px_open = required_str(item, "entry_price")?
+            .parse::<Decimal>()
+            .map_err(|e| anyhow::anyhow!("mock_http invalid position entry_price: {e}"))?;
+
+        Ok(PositionStatusReport::new(
+            self.account_id,
+            self.instrument_id,
+            side,
+            quantity,
+            ts,
+            ts,
+            None,
+            None,
+            Some(avg_px_open),
+        ))
+    }
+}
+
+fn required_str<'a>(item: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    item.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("mock_http report item missing string field {field}"))
+}
+
+fn required_i64(item: &Value, field: &str) -> anyhow::Result<i64> {
+    item.get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("mock_http report item missing i64 field {field}"))
+}
+
+fn timestamp_ms_to_ns(timestamp_ms: i64) -> anyhow::Result<UnixNanos> {
+    u64::try_from(timestamp_ms)
+        .map_err(|_| anyhow::anyhow!("mock_http invalid timestamp: {timestamp_ms}"))?
+        .checked_mul(1_000_000)
+        .map(UnixNanos::from)
+        .ok_or_else(|| anyhow::anyhow!("mock_http timestamp overflow: {timestamp_ms}"))
+}
+
+fn order_side_from_str(side: &str) -> anyhow::Result<OrderSide> {
+    match side {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        other => Err(anyhow::anyhow!("mock_http unsupported order side: {other}")),
+    }
 }
 
 /// Live execution client for the Lighter DEX adapter.
@@ -1222,6 +1498,18 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        if is_mock_http_report_request(cmd.params.as_ref()) {
+            warn!("generate_order_status_report: using mock HTTP report source");
+            let reports = MockHttpReportSource::from_params(
+                cmd.params.as_ref(),
+                self.core.account_id,
+                cmd.instrument_id,
+            )?
+            .order_status_reports()
+            .await?;
+            return Ok(reports.into_iter().next());
+        }
+
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
             warn!("generate_order_status_report: live API not implemented");
             return Ok(None);
@@ -1237,6 +1525,17 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        if is_mock_http_report_request(cmd.params.as_ref()) {
+            warn!("generate_order_status_reports: using mock HTTP report source");
+            return MockHttpReportSource::from_params(
+                cmd.params.as_ref(),
+                self.core.account_id,
+                cmd.instrument_id,
+            )?
+            .order_status_reports()
+            .await;
+        }
+
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
             warn!("generate_order_status_reports: live API not implemented");
             return Ok(Vec::new());
@@ -1251,6 +1550,17 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        if is_mock_http_report_request(cmd.params.as_ref()) {
+            warn!("generate_fill_reports: using mock HTTP report source");
+            return MockHttpReportSource::from_params(
+                cmd.params.as_ref(),
+                self.core.account_id,
+                cmd.instrument_id,
+            )?
+            .fill_reports()
+            .await;
+        }
+
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
             warn!("generate_fill_reports: live API not implemented");
             return Ok(Vec::new());
@@ -1264,6 +1574,17 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        if is_mock_http_report_request(cmd.params.as_ref()) {
+            warn!("generate_position_status_reports: using mock HTTP report source");
+            return MockHttpReportSource::from_params(
+                cmd.params.as_ref(),
+                self.core.account_id,
+                cmd.instrument_id,
+            )?
+            .position_status_reports()
+            .await;
+        }
+
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
             warn!("generate_position_status_reports: live API not implemented");
             return Ok(Vec::new());
@@ -1278,6 +1599,17 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        if let Some(params) = mock_http_report_params_from_config(&self.config) {
+            warn!("generate_mass_status: using mock HTTP report source");
+            return MockHttpReportSource::from_params(
+                Some(&params),
+                self.core.account_id,
+                Some(InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID)),
+            )?
+            .mass_status(self.core.client_id, self.core.venue)
+            .await;
+        }
+
         if lookback_mins != Some(OFFLINE_REPORT_LOOKBACK_MINS) {
             warn!("generate_mass_status: live API not implemented");
             return Ok(None);
@@ -1290,14 +1622,23 @@ impl ExecutionClient for LighterExecutionClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
 
+    use axum::{
+        Router,
+        extract::{Query, State},
+        http::StatusCode,
+        response::Json,
+        routing::get,
+    };
     use dashmap::DashMap;
     use nautilus_common::cache::Cache;
+    use nautilus_core::UUID4;
     use nautilus_model::{
         enums::AccountType,
-        identifiers::{InstrumentId, TraderId},
+        identifiers::{InstrumentId, TraderId, VenueOrderId},
     };
+    use serde_json::{Value, json};
 
     use crate::{
         common::LighterEnvironment,
@@ -1332,7 +1673,9 @@ mod tests {
         assert_ne!(Some(OFFLINE_REPORT_LOOKBACK_MINS), None);
     }
 
-    fn test_execution_client() -> LighterExecutionClient {
+    fn test_execution_client_with_config(
+        config: LighterExecClientConfig,
+    ) -> LighterExecutionClient {
         let core = ExecutionClientCore::new(
             TraderId::from("TESTER-001"),
             ClientId::from("LIGHTER"),
@@ -1343,15 +1686,17 @@ mod tests {
             None,
             Rc::new(RefCell::new(Cache::default())),
         );
-        let config = LighterExecClientConfig::new(
+        LighterExecutionClient::new(core, config).expect("test execution client")
+    }
+
+    fn test_execution_client() -> LighterExecutionClient {
+        test_execution_client_with_config(LighterExecClientConfig::new(
             "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
             42,
             2,
             LighterEnvironment::Testnet,
-        );
-
-        LighterExecutionClient::new(core, config).expect("test execution client")
+        ))
     }
 
     #[test]
@@ -1417,7 +1762,10 @@ mod tests {
 
     #[test]
     fn offline_report_source_returns_fixture_backed_results() {
-        let src = default_offline_report_source(ClientId::from("LIGHTER"), AccountId::from("LIGHTER-001"));
+        let src = default_offline_report_source(
+            ClientId::from("LIGHTER"),
+            AccountId::from("LIGHTER-001"),
+        );
 
         assert_eq!(src.order_status_reports().unwrap().len(), 6);
         assert_eq!(src.fill_reports().unwrap().len(), 1);
@@ -1449,6 +1797,458 @@ mod tests {
         assert_eq!(mass_status.order_reports().len(), 6);
         assert_eq!(mass_status.fill_reports().len(), 1);
         assert_eq!(mass_status.position_reports().len(), 1);
+    }
+
+    #[derive(Clone)]
+    struct MockReportServerState {
+        mode: MockReportMode,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockReportMode {
+        Deterministic,
+        Empty,
+        Error,
+    }
+
+    async fn handle_mock_orders(
+        State(state): State<MockReportServerState>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        match state.mode {
+            MockReportMode::Deterministic => {
+                let cursor = query.get("cursor").map(String::as_str);
+                let (items, next_cursor) = match cursor {
+                    Some("page-2") => (
+                        vec![json!({
+                            "order_id": "9002",
+                            "client_order_id": "P2L-ORDER-2",
+                            "market_index": 1,
+                            "status": "filled",
+                            "side": "sell",
+                            "order_type": "limit",
+                            "price": "102.50",
+                            "quantity": "0.1250",
+                            "filled_quantity": "0.1250",
+                            "timestamp": 1734200001000_i64
+                        })],
+                        Value::Null,
+                    ),
+                    _ => (
+                        vec![json!({
+                            "order_id": "9001",
+                            "client_order_id": "P2L-ORDER-1",
+                            "market_index": 1,
+                            "status": "open",
+                            "side": "buy",
+                            "order_type": "limit",
+                            "price": "101.25",
+                            "quantity": "0.2500",
+                            "filled_quantity": "0.0000",
+                            "timestamp": 1734200000000_i64
+                        })],
+                        json!("page-2"),
+                    ),
+                };
+                Ok(Json(json!({
+                    "success": true,
+                    "data": {
+                        "items": items,
+                        "next_cursor": next_cursor
+                    }
+                })))
+            }
+            MockReportMode::Empty => Ok(Json(json!({
+                "success": true,
+                "data": {
+                    "items": [],
+                    "next_cursor": null
+                }
+            }))),
+            MockReportMode::Error => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    async fn handle_mock_fills(
+        State(state): State<MockReportServerState>,
+    ) -> Result<Json<Value>, StatusCode> {
+        match state.mode {
+            MockReportMode::Deterministic => Ok(Json(json!({
+                "success": true,
+                "data": {
+                    "items": [{
+                        "trade_id": "T-9001",
+                        "order_id": "9001",
+                        "client_order_id": "P2L-ORDER-1",
+                        "market_index": 1,
+                        "price": "101.25",
+                        "quantity": "0.2500",
+                        "side": "buy",
+                        "timestamp": 1734200000000_i64
+                    }],
+                    "next_cursor": null
+                }
+            }))),
+            MockReportMode::Empty => Ok(Json(json!({
+                "success": true,
+                "data": {
+                    "items": [],
+                    "next_cursor": null
+                }
+            }))),
+            MockReportMode::Error => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    async fn handle_mock_positions(
+        State(state): State<MockReportServerState>,
+    ) -> Result<Json<Value>, StatusCode> {
+        match state.mode {
+            MockReportMode::Deterministic => Ok(Json(json!({
+                "success": true,
+                "data": {
+                    "items": [{
+                        "market_index": 1,
+                        "symbol": "ETH_USDC",
+                        "size": "0.2500",
+                        "entry_price": "101.25",
+                        "timestamp": 1734200000000_i64
+                    }],
+                    "next_cursor": null
+                }
+            }))),
+            MockReportMode::Empty => Ok(Json(json!({
+                "success": true,
+                "data": {
+                    "items": [],
+                    "next_cursor": null
+                }
+            }))),
+            MockReportMode::Error => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    fn mock_report_params(base_url: &str) -> Params {
+        let mut params = Params::new();
+        params.insert(
+            "lighter_report_source".to_string(),
+            serde_json::Value::String("mock_http".to_string()),
+        );
+        params.insert(
+            "lighter_report_base_url".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+        params.insert(
+            "lighter_report_page_limit".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(1)),
+        );
+        params
+    }
+
+    async fn start_mock_report_server(mode: MockReportMode) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock report server");
+        let addr = listener.local_addr().expect("mock report server addr");
+        let router = Router::new()
+            .route("/api/v1/account_active_orders", get(handle_mock_orders))
+            .route("/api/v1/account_fills", get(handle_mock_fills))
+            .route("/api/v1/account_positions", get(handle_mock_positions))
+            .with_state(MockReportServerState { mode });
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve mock report server");
+        });
+
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return addr;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("mock report server did not start");
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_returns_deterministic_reports_and_follows_pages() {
+        let addr = start_mock_report_server(MockReportMode::Deterministic).await;
+        let params = mock_report_params(&format!("http://{addr}"));
+        let client = test_execution_client();
+        let instrument_id = Some(InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID));
+
+        let order_reports = client
+            .generate_order_status_reports(&GenerateOrderStatusReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                false,
+                instrument_id,
+                None,
+                None,
+                Some(params.clone()),
+                None,
+            ))
+            .await
+            .expect("mock HTTP order reports");
+        let fill_reports = client
+            .generate_fill_reports(GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                instrument_id,
+                Some(VenueOrderId::new("9001")),
+                None,
+                None,
+                Some(params.clone()),
+                None,
+            ))
+            .await
+            .expect("mock HTTP fill reports");
+        let position_reports = client
+            .generate_position_status_reports(&GeneratePositionStatusReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                instrument_id,
+                None,
+                None,
+                Some(params),
+                None,
+            ))
+            .await
+            .expect("mock HTTP position reports");
+
+        assert_eq!(order_reports.len(), 2, "must follow next_cursor pagination");
+        assert_eq!(order_reports[0].venue_order_id.as_str(), "9001");
+        assert_eq!(order_reports[1].venue_order_id.as_str(), "9002");
+        assert_eq!(fill_reports.len(), 1);
+        assert_eq!(fill_reports[0].trade_id.as_str(), "T-9001");
+        assert_eq!(position_reports.len(), 1);
+        assert_eq!(position_reports[0].quantity.to_string(), "0.2500");
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_preserves_empty_and_error_semantics() {
+        let empty_addr = start_mock_report_server(MockReportMode::Empty).await;
+        let empty_params = mock_report_params(&format!("http://{empty_addr}"));
+        let client = test_execution_client();
+        let instrument_id = Some(InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID));
+
+        let no_single_order = client
+            .generate_order_status_report(&GenerateOrderStatusReport::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                instrument_id,
+                Some(ClientOrderId::new("P2L-MISSING")),
+                None,
+                Some(empty_params.clone()),
+                None,
+            ))
+            .await
+            .expect("mock HTTP empty single order response");
+        let empty_orders = client
+            .generate_order_status_reports(&GenerateOrderStatusReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                false,
+                instrument_id,
+                None,
+                None,
+                Some(empty_params),
+                None,
+            ))
+            .await
+            .expect("mock HTTP empty order reports");
+
+        assert!(no_single_order.is_none());
+        assert!(empty_orders.is_empty());
+
+        let error_addr = start_mock_report_server(MockReportMode::Error).await;
+        let error_params = mock_report_params(&format!("http://{error_addr}"));
+        let err = client
+            .generate_fill_reports(GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                instrument_id,
+                None,
+                None,
+                None,
+                Some(error_params),
+                None,
+            ))
+            .await
+            .expect_err("mock HTTP report errors must not fallback to fixture or empty success");
+
+        assert!(
+            err.to_string().contains("500") || err.to_string().contains("mock_http"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_generate_mass_status_uses_configured_mock_server() {
+        let addr = start_mock_report_server(MockReportMode::Deterministic).await;
+        let mut config = LighterExecClientConfig::new(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            42,
+            2,
+            LighterEnvironment::Testnet,
+        );
+        config.report_source = Some("mock_http".to_string());
+        config.report_base_url = Some(format!("http://{addr}"));
+        config.report_page_limit = Some(1);
+        let client = test_execution_client_with_config(config);
+
+        let mass_status = client
+            .generate_mass_status(None)
+            .await
+            .expect("mock HTTP generate_mass_status")
+            .expect("configured mock HTTP source should return mass status");
+
+        assert!(
+            mass_status
+                .order_reports()
+                .contains_key(&VenueOrderId::new("9001"))
+        );
+        assert!(
+            mass_status
+                .fill_reports()
+                .contains_key(&VenueOrderId::new("9001"))
+        );
+        assert!(
+            mass_status
+                .position_reports()
+                .contains_key(&InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID))
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_generate_mass_status_returns_empty_status_for_empty_server() {
+        let addr = start_mock_report_server(MockReportMode::Empty).await;
+        let mut config = LighterExecClientConfig::new(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            42,
+            2,
+            LighterEnvironment::Testnet,
+        );
+        config.report_source = Some("mock_http".to_string());
+        config.report_base_url = Some(format!("http://{addr}"));
+        let client = test_execution_client_with_config(config);
+
+        let mass_status = client
+            .generate_mass_status(None)
+            .await
+            .expect("empty mock HTTP generate_mass_status")
+            .expect("reachable empty mock HTTP source should return empty mass status");
+
+        assert!(mass_status.order_reports().is_empty());
+        assert!(mass_status.fill_reports().is_empty());
+        assert!(mass_status.position_reports().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_generate_mass_status_errors_for_error_server() {
+        let addr = start_mock_report_server(MockReportMode::Error).await;
+        let mut config = LighterExecClientConfig::new(
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            42,
+            2,
+            LighterEnvironment::Testnet,
+        );
+        config.report_source = Some("mock_http".to_string());
+        config.report_base_url = Some(format!("http://{addr}"));
+        let client = test_execution_client_with_config(config);
+
+        let err = client
+            .generate_mass_status(None)
+            .await
+            .expect_err("mock HTTP generate_mass_status errors must not fallback");
+
+        assert!(
+            err.to_string().contains("500") || err.to_string().contains("mock_http"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_mass_status_aggregates_reports() {
+        let addr = start_mock_report_server(MockReportMode::Deterministic).await;
+        let params = mock_report_params(&format!("http://{addr}"));
+        let source = MockHttpReportSource::from_params(
+            Some(&params),
+            AccountId::from("LIGHTER-001"),
+            Some(InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID)),
+        )
+        .expect("mock HTTP source");
+
+        let mass_status = source
+            .mass_status(ClientId::from("LIGHTER"), *LIGHTER_VENUE)
+            .await
+            .expect("mock HTTP mass status")
+            .expect("reachable mock HTTP source should return a mass status");
+
+        assert_eq!(mass_status.order_reports().len(), 2);
+        assert!(
+            mass_status
+                .order_reports()
+                .contains_key(&VenueOrderId::new("9001"))
+        );
+        assert!(
+            mass_status
+                .order_reports()
+                .contains_key(&VenueOrderId::new("9002"))
+        );
+        assert_eq!(mass_status.fill_reports().len(), 1);
+        assert!(
+            mass_status
+                .fill_reports()
+                .contains_key(&VenueOrderId::new("9001"))
+        );
+        assert_eq!(mass_status.position_reports().len(), 1);
+        assert!(
+            mass_status
+                .position_reports()
+                .contains_key(&InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID))
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_http_report_source_mass_status_preserves_empty_and_error_semantics() {
+        let client_id = ClientId::from("LIGHTER");
+        let account_id = AccountId::from("LIGHTER-001");
+        let instrument_id = Some(InstrumentId::from(OFFLINE_REPORT_INSTRUMENT_ID));
+
+        let empty_addr = start_mock_report_server(MockReportMode::Empty).await;
+        let empty_params = mock_report_params(&format!("http://{empty_addr}"));
+        let empty_source =
+            MockHttpReportSource::from_params(Some(&empty_params), account_id, instrument_id)
+                .expect("empty mock HTTP source");
+        let empty_mass_status = empty_source
+            .mass_status(client_id, *LIGHTER_VENUE)
+            .await
+            .expect("empty mock HTTP mass status")
+            .expect("reachable empty mock HTTP source should return empty mass status");
+
+        assert!(empty_mass_status.order_reports().is_empty());
+        assert!(empty_mass_status.fill_reports().is_empty());
+        assert!(empty_mass_status.position_reports().is_empty());
+
+        let error_addr = start_mock_report_server(MockReportMode::Error).await;
+        let error_params = mock_report_params(&format!("http://{error_addr}"));
+        let error_source =
+            MockHttpReportSource::from_params(Some(&error_params), account_id, instrument_id)
+                .expect("error mock HTTP source");
+        let err = error_source
+            .mass_status(client_id, *LIGHTER_VENUE)
+            .await
+            .expect_err("mock HTTP mass status errors must not fallback to fixture or None");
+
+        assert!(
+            err.to_string().contains("500") || err.to_string().contains("mock_http"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
