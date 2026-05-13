@@ -36,9 +36,11 @@
 pub mod client;
 pub mod endpoints;
 pub mod parse;
+pub mod retry;
 pub mod types;
 
 pub use client::LighterRawHttpClient;
 pub use endpoints::*;
 pub use parse::*;
+pub use retry::*;
 pub use types::*;

@@ -15,26 +15,29 @@
 
 //! HTTP integration tests for the Lighter adapter.
 
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
     extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json},
     routing::{get, post},
-    response::Json,
 };
-use serde_json::{json, Value};
+use nautilus_lighter::{
+    error::LighterError,
+    http::{
+        client::LighterRawHttpClient,
+        endpoints::{
+            ACCOUNT, ACCOUNT_ACTIVE_ORDERS, CANDLESTICKS, NEXT_NONCE, ORDER_BOOK_ORDERS,
+            ORDER_BOOKS, RECENT_TRADES, SEND_TX,
+        },
+        types::{LighterList, LighterResponse, Market, NextNonceResponse, TxResponse},
+    },
+};
+use nautilus_network::retry::RetryConfig;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
-
-use nautilus_lighter::http::{
-    client::LighterRawHttpClient,
-    endpoints::{ORDER_BOOKS, NEXT_NONCE, SEND_TX, CANDLESTICKS, ACCOUNT, ACCOUNT_ACTIVE_ORDERS, RECENT_TRADES, ORDER_BOOK_ORDERS},
-    types::{LighterResponse, LighterList, Market, NextNonceResponse, TxResponse},
-};
 
 // ------------------------------------------------------------------------------------------------
 // Test server state
@@ -45,6 +48,7 @@ struct TestServerState {
     request_count: Arc<Mutex<usize>>,
     last_request_body: Arc<Mutex<Option<Value>>>,
     should_fail: Arc<Mutex<bool>>,
+    failures_before_success: Arc<Mutex<usize>>,
 }
 
 impl TestServerState {
@@ -70,6 +74,21 @@ impl TestServerState {
         *self.should_fail.lock().await
     }
 
+    async fn set_failures_before_success(&self, failures: usize) {
+        let mut remaining = self.failures_before_success.lock().await;
+        *remaining = failures;
+    }
+
+    async fn consume_transient_failure(&self) -> bool {
+        let mut remaining = self.failures_before_success.lock().await;
+        if *remaining == 0 {
+            false
+        } else {
+            *remaining -= 1;
+            true
+        }
+    }
+
     async fn store_request_body(&self, body: Value) {
         let mut last_body = self.last_request_body.lock().await;
         *last_body = Some(body);
@@ -84,14 +103,26 @@ impl TestServerState {
 // Mock handlers
 // ------------------------------------------------------------------------------------------------
 
-async fn handle_order_books(State(state): State<TestServerState>) -> Json<Value> {
+async fn handle_order_books(State(state): State<TestServerState>) -> impl IntoResponse {
     state.increment_request_count().await;
+
+    if state.consume_transient_failure().await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "error": "rate limit"
+            })),
+        )
+            .into_response();
+    }
 
     if state.should_fail().await {
         return Json(json!({
             "success": false,
             "error": "Internal server error"
-        }));
+        }))
+        .into_response();
     }
 
     Json(json!({
@@ -123,6 +154,7 @@ async fn handle_order_books(State(state): State<TestServerState>) -> Json<Value>
             ]
         }
     }))
+    .into_response()
 }
 
 async fn handle_next_nonce(State(state): State<TestServerState>) -> Json<Value> {
@@ -201,14 +233,18 @@ async fn handle_candlesticks(State(state): State<TestServerState>) -> Json<Value
     }))
 }
 
-async fn handle_account(State(state): State<TestServerState>) -> Json<Value> {
+async fn handle_account(State(state): State<TestServerState>) -> impl IntoResponse {
     state.increment_request_count().await;
 
     if state.should_fail().await {
-        return Json(json!({
-            "success": false,
-            "error": "Unauthorized"
-        }));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "success": false,
+                "error": "Unauthorized"
+            })),
+        )
+            .into_response();
     }
 
     Json(json!({
@@ -224,6 +260,7 @@ async fn handle_account(State(state): State<TestServerState>) -> Json<Value> {
             "free_collateral": "80000.00"
         }
     }))
+    .into_response()
 }
 
 async fn handle_active_orders(State(state): State<TestServerState>) -> Json<Value> {
@@ -322,7 +359,8 @@ fn create_test_router(state: TestServerState) -> Router {
         .with_state(state)
 }
 
-async fn start_test_server() -> Result<(SocketAddr, TestServerState), Box<dyn std::error::Error + Send + Sync>> {
+async fn start_test_server()
+-> Result<(SocketAddr, TestServerState), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let state = TestServerState::new();
@@ -355,6 +393,27 @@ fn create_test_client(addr: SocketAddr) -> LighterRawHttpClient {
         .expect("Failed to create test client")
 }
 
+fn create_fast_retry_client(addr: SocketAddr, max_retries: u32) -> LighterRawHttpClient {
+    let base_url = format!("http://{}", addr);
+    LighterRawHttpClient::with_base_url(
+        &base_url,
+        None,
+        Some(30),
+        None,
+        Some(RetryConfig {
+            max_retries,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            backoff_factor: 1.0,
+            jitter_ms: 0,
+            operation_timeout_ms: Some(1_000),
+            immediate_first: false,
+            max_elapsed_ms: Some(5_000),
+        }),
+    )
+    .expect("Failed to create retry test client")
+}
+
 // ------------------------------------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------------------------------------
@@ -364,10 +423,8 @@ async fn test_get_markets() {
     let (addr, state) = start_test_server().await.unwrap();
     let client = create_test_client(addr);
 
-    let response: LighterResponse<LighterList<Market>> = client
-        .get(ORDER_BOOKS, None)
-        .await
-        .expect("Request failed");
+    let response: LighterResponse<LighterList<Market>> =
+        client.get(ORDER_BOOKS, None).await.expect("Request failed");
 
     assert!(response.success);
     assert!(response.data.is_some());
@@ -379,6 +436,33 @@ async fn test_get_markets() {
     assert_eq!(markets.items[1].symbol, "BTC_USDC");
     assert_eq!(markets.items[1].market_index, 2);
 
+    assert_eq!(state.get_request_count().await, 1);
+}
+
+#[tokio::test]
+async fn test_get_markets_retries_429_with_backoff_budget() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state.set_failures_before_success(2).await;
+    let client = create_fast_retry_client(addr, 2);
+
+    let response: LighterResponse<LighterList<Market>> = client
+        .get(ORDER_BOOKS, None)
+        .await
+        .expect("429 should retry and then recover");
+
+    assert!(response.success);
+    assert_eq!(state.get_request_count().await, 3);
+}
+
+#[tokio::test]
+async fn test_auth_errors_fail_fast_without_retry() {
+    let (addr, state) = start_test_server().await.unwrap();
+    state.set_should_fail(true).await;
+    let client = create_fast_retry_client(addr, 3);
+
+    let result: Result<Value, LighterError> = client.get(ACCOUNT, Some("account_index=878")).await;
+
+    assert!(matches!(result, Err(LighterError::Auth(message)) if message.contains("Unauthorized")));
     assert_eq!(state.get_request_count().await, 1);
 }
 
@@ -442,10 +526,8 @@ async fn test_error_handling_markets() {
 
     let client = create_test_client(addr);
 
-    let response: LighterResponse<LighterList<Market>> = client
-        .get(ORDER_BOOKS, None)
-        .await
-        .expect("Request failed");
+    let response: LighterResponse<LighterList<Market>> =
+        client.get(ORDER_BOOKS, None).await.expect("Request failed");
 
     assert!(!response.success);
     assert!(response.error.is_some());
@@ -481,10 +563,8 @@ async fn test_multiple_requests() {
 
     // Make multiple requests
     for _ in 0..5 {
-        let _: LighterResponse<LighterList<Market>> = client
-            .get(ORDER_BOOKS, None)
-            .await
-            .expect("Request failed");
+        let _: LighterResponse<LighterList<Market>> =
+            client.get(ORDER_BOOKS, None).await.expect("Request failed");
     }
 
     assert_eq!(state.get_request_count().await, 5);
@@ -520,7 +600,10 @@ async fn test_get_account() {
 
     assert!(response["success"].as_bool().unwrap());
     assert_eq!(response["data"]["account_index"].as_i64().unwrap(), 878);
-    assert_eq!(response["data"]["balances"]["USDC"].as_str().unwrap(), "100000.00");
+    assert_eq!(
+        response["data"]["balances"]["USDC"].as_str().unwrap(),
+        "100000.00"
+    );
 
     assert_eq!(state.get_request_count().await, 1);
 }

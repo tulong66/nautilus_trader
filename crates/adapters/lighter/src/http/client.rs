@@ -39,10 +39,7 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use crate::{
-    common::LighterEnvironment,
-    error::LighterError,
-};
+use crate::{common::LighterEnvironment, error::LighterError, http::retry::LighterRetryPolicy};
 
 /// Default rate limit for Lighter API.
 ///
@@ -93,6 +90,7 @@ pub struct LighterRawHttpClient {
     base_url: String,
     client: HttpClient,
     retry_manager: RetryManager<LighterError>,
+    retry_policy: LighterRetryPolicy,
     cancellation_token: CancellationToken,
     auth_token: Option<String>,
 }
@@ -137,7 +135,10 @@ impl LighterRawHttpClient {
     ) -> Result<Self, LighterError> {
         let base_url = environment.http_url().to_string();
 
-        let retry_manager = RetryManager::new(retry_config.unwrap_or_default());
+        let retry_policy = retry_config
+            .map(LighterRetryPolicy::from_retry_config)
+            .unwrap_or_else(|| LighterRetryPolicy::for_latency_tier(300));
+        let retry_manager = retry_policy.retry_manager();
 
         // Build default headers
         let mut headers = HashMap::new();
@@ -151,8 +152,8 @@ impl LighterRawHttpClient {
 
         let client = HttpClient::new(
             headers,
-            vec![],                   // No specific headers to extract
-            vec![],                   // No keyed quotas
+            vec![],                    // No specific headers to extract
+            vec![],                    // No keyed quotas
             Some(*LIGHTER_REST_QUOTA), // Global rate limit
             timeout_secs,
             proxy_url,
@@ -166,6 +167,7 @@ impl LighterRawHttpClient {
             base_url,
             client,
             retry_manager,
+            retry_policy,
             cancellation_token: CancellationToken::new(),
             auth_token,
         })
@@ -235,7 +237,10 @@ impl LighterRawHttpClient {
         proxy_url: Option<String>,
         retry_config: Option<RetryConfig>,
     ) -> Result<Self, LighterError> {
-        let retry_manager = RetryManager::new(retry_config.unwrap_or_default());
+        let retry_policy = retry_config
+            .map(LighterRetryPolicy::from_retry_config)
+            .unwrap_or_else(|| LighterRetryPolicy::for_latency_tier(300));
+        let retry_manager = retry_policy.retry_manager();
 
         // Build default headers
         let mut headers = HashMap::new();
@@ -249,21 +254,25 @@ impl LighterRawHttpClient {
 
         let client = HttpClient::new(
             headers,
-            vec![],                   // No specific headers to extract
-            vec![],                   // No keyed quotas
+            vec![],                    // No specific headers to extract
+            vec![],                    // No keyed quotas
             Some(*LIGHTER_REST_QUOTA), // Global rate limit
             timeout_secs,
             proxy_url,
         )
         .map_err(|e| LighterError::Http(format!("Failed to create HTTP client: {e}")))?;
 
-        debug!("Created LighterRawHttpClient with custom base URL: {}", base_url);
+        debug!(
+            "Created LighterRawHttpClient with custom base URL: {}",
+            base_url
+        );
 
         Ok(Self {
             environment: LighterEnvironment::Testnet, // Default for custom URL
             base_url: base_url.to_string(),
             client,
             retry_manager,
+            retry_policy,
             cancellation_token: CancellationToken::new(),
             auth_token,
         })
@@ -299,11 +308,7 @@ impl LighterRawHttpClient {
     /// - The response status is not successful
     /// - The response cannot be deserialized
     /// - The request is canceled
-    pub async fn post<T, B>(
-        &self,
-        endpoint: &str,
-        body: Option<B>,
-    ) -> Result<T, LighterError>
+    pub async fn post<T, B>(&self, endpoint: &str, body: Option<B>) -> Result<T, LighterError>
     where
         T: DeserializeOwned,
         B: serde::Serialize,
@@ -363,7 +368,7 @@ impl LighterRawHttpClient {
                 .request_with_ustr_keys(
                     method.clone(),
                     url.clone(),
-                    None, // Query params already in URL
+                    None,    // Query params already in URL
                     headers, // Pass auth header dynamically
                     body.clone(),
                     None, // Use default timeout
@@ -388,42 +393,20 @@ impl LighterRawHttpClient {
             Ok(response)
         };
 
-        // Retry strategy:
-        // - Network errors: retry
-        // - 429 (rate limit): retry with backoff
-        // - 5xx (server errors): retry
-        // - 4xx (client errors except 429): do not retry
-        let should_retry = |error: &LighterError| -> bool {
-            matches!(
-                error,
-                LighterError::Http(_) | LighterError::RateLimit(_) | LighterError::Timeout(_)
-            )
-        };
-
-        let create_error = |msg: String| -> LighterError {
-            if msg == "canceled" {
-                LighterError::Internal("Request canceled".to_string())
-            } else {
-                LighterError::Internal(msg)
-            }
-        };
-
-        // Execute with retry
+        // Execute with retry. The policy retries only transient transport/status failures,
+        // timeouts, and 429 rate limits; auth/config/parse/signing/business rejects fail fast.
         let response = self
             .retry_manager
             .execute_with_retry_with_cancel(
                 endpoint,
                 operation,
-                should_retry,
-                create_error,
+                |error| self.retry_policy.should_retry(error),
+                LighterRetryPolicy::create_retry_manager_error,
                 &self.cancellation_token,
             )
             .await?;
 
-        trace!(
-            "Lighter HTTP response: {} bytes",
-            response.body.len()
-        );
+        trace!("Lighter HTTP response: {} bytes", response.body.len());
 
         // Deserialize response
         serde_json::from_slice(&response.body).map_err(|e| {
@@ -441,14 +424,9 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = LighterRawHttpClient::new(
-            LighterEnvironment::Testnet,
-            None,
-            Some(30),
-            None,
-            None,
-        )
-        .unwrap();
+        let client =
+            LighterRawHttpClient::new(LighterEnvironment::Testnet, None, Some(30), None, None)
+                .unwrap();
 
         assert_eq!(client.environment(), LighterEnvironment::Testnet);
         assert!(client.base_url().contains("testnet"));
@@ -471,14 +449,9 @@ mod tests {
 
     #[test]
     fn test_set_auth_token() {
-        let mut client = LighterRawHttpClient::new(
-            LighterEnvironment::Testnet,
-            None,
-            Some(30),
-            None,
-            None,
-        )
-        .unwrap();
+        let mut client =
+            LighterRawHttpClient::new(LighterEnvironment::Testnet, None, Some(30), None, None)
+                .unwrap();
 
         assert!(!client.has_auth());
 

@@ -66,10 +66,17 @@
 | L | Live report API 设计与 mock server 接入：为 order/fill/position/mass report 设计真实数据来源接口，但只用 mock server 验证 | [x] | J 后可并行 | 已添加 `mock_http` report source；order/fill/position 通过 params 指向 axum mock server，mass status 通过 execution config 指向 mock server；覆盖确定性 reports、empty、error、`next_cursor` pagination；默认 live 路径仍返回未实现且 `connect()` live signing gate 不变；不读取 `.env`、不连接真实 private WS、不触发实盘路径 |
 | M | Execution state reconciliation：建立 send/order update/account update/fill/cancel/cancel-reject 的状态机与去重规则 | [x] | J 后可并行 | 已新增 `execution::reconciliation` 状态机并接入 WS handler；fixture/replay 覆盖 send、order update、account update、fill、cancel、cancel rejected、重复消息、乱序消息；不产生真实订单；`cargo +1.95.0 test -p nautilus-lighter` 与 `cargo +1.95.0 check -p nautilus-lighter --features python` 通过 |
 | N | Sequencer 与 `sendTx` 语义建模：区分 accepted/submitted/executed/rejected，处理 `code=200` 但未 executed 的状态 | [x] | J 后可并行 | 已新增 fixture/mock response 语义解释与 reconciliation 记录：覆盖 sequencer reject、timeout、pending、executed、`code=200 != executed`；submitted/executed/pending/timeout 均不会被 sendTx alone 误报为 filled；`cargo +1.95.0 test -p nautilus-lighter` 与 `cargo +1.95.0 check -p nautilus-lighter --features python` 通过 |
-| O | Latency / retry / rate-limit 模型：整理 Standard 200/300ms latency、超时、重试、退避和限流策略 | [ ] | J 后可并行 | 单元测试覆盖 retry budget、timeout、rate-limit backoff；文档明确哪些路径可重试、哪些必须 fail-fast |
+| O | Latency / retry / rate-limit 模型：整理 Standard 200/300ms latency、超时、重试、退避和限流策略 | [x] | J 后可并行 | 已新增 `http::retry::LighterRetryPolicy`；单元测试覆盖 retry budget、timeout、429/rate-limit backoff、fail-fast 分类；HTTP mock 测试覆盖 429 retry 与 401 auth fail-fast |
 | P | Funding / margin / liquidation 风险输入：解析 funding endpoint/history，并建模 IMR/MMR/CMR/liquidation 前置数据 | [ ] | J 后可并行 | fixture-backed parser 覆盖 funding history、margin ratios、liquidation thresholds；不接入真实账户风险动作 |
 | Q | Paper/replay soak 验证：用录制 public/private fixture 长时间回放，验证 execution/account/report 一致性 | [ ] | J 后可并行 | replay 不需要认证；覆盖断线重连、订阅恢复、重复消息、空账户/空订单；输出可复现实验记录 |
 | R | Verification + docs：完成下一阶段验证并更新状态报告与 Track B 指针 | [ ] | 依赖 J-Q | `cargo +1.95.0 test -p nautilus-lighter`、`cargo +1.95.0 check -p nautilus-lighter --features python`、Python smoke test 通过；本任务板按实际结果更新 |
+
+#### P2-O retry / timeout / rate-limit 策略说明
+
+- Lighter Standard latency tier 按 200ms/300ms 建模为 retry 初始退避基准；默认 adapter 路径使用 300ms，保留显式 `RetryConfig` 覆盖入口。
+- 可重试路径：HTTP 408/429/5xx、transport/network 类 `Http` 错误、`RateLimit`、`Timeout`；429 进入普通 backoff/retry budget，不被业务错误掩盖。
+- fail-fast 路径：`Auth`、`Config`、`Signing`、`Parse`、`OrderRejected`、输入/业务拒绝、以及任何未明确归类为 transient 的错误；这些路径不消耗 retry budget，也不会掩盖认证缺失或真实资金风险拒绝。
+- timeout 由 retry policy 的 operation timeout 统一转换为 `LighterError::Timeout`，并按 retry budget 限制最大尝试次数。
 
 ### P3 — 延后研究/增强
 
