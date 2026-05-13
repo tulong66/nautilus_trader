@@ -54,7 +54,7 @@ use crate::{
     execution::{
         dispatch::dispatch_private_message,
         fixtures::execution_fixture_set,
-        reconciliation::{ExecutionReconciler, ReconciliationAction},
+        reconciliation::{ExecutionReconciler, ReconciliationAction, interpret_send_tx_response},
         reports::{
             build_fill_report, build_mass_status, build_order_status_report,
             build_position_status_report,
@@ -741,11 +741,12 @@ impl LighterExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {e}"))?;
 
+        let sequencer_status = interpret_send_tx_response(&response);
         if response.success {
             if let Some(data) = response.data {
                 info!(
-                    "Order {} submitted successfully, tx_id: {:?}, order_index: {:?}",
-                    client_order_id, data.tx_id, data.order_index
+                    "Order {} send_tx status: {:?}, tx_id: {:?}, order_index: {:?}",
+                    client_order_id, sequencer_status, data.tx_id, data.order_index
                 );
             }
         } else {
@@ -771,10 +772,11 @@ impl LighterExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("Cancel request failed: {e}"))?;
 
+        let sequencer_status = interpret_send_tx_response(&response);
         if response.success {
             info!(
-                "Cancel request for {} submitted successfully",
-                client_order_id
+                "Cancel request for {} send_tx status: {:?}",
+                client_order_id, sequencer_status
             );
         } else {
             let error_msg = response
@@ -801,8 +803,9 @@ impl LighterExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("Cancel all request failed: {e}"))?;
 
+        let sequencer_status = interpret_send_tx_response(&response);
         if response.success {
-            info!("Cancel all orders request submitted successfully");
+            info!("Cancel all orders send_tx status: {:?}", sequencer_status);
         } else {
             let error_msg = response
                 .error

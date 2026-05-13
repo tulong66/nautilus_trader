@@ -15,12 +15,19 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::execution::dispatch::{DispatchOutcome, OrderDispatchStatus};
+use crate::{
+    execution::dispatch::{DispatchOutcome, OrderDispatchStatus},
+    http::types::TxResponse,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReconciledOrderStatus {
     Sent,
+    Submitted,
     Accepted,
+    Executed,
+    Pending,
+    Timeout,
     PartiallyFilled,
     Filled,
     CancelPending,
@@ -35,6 +42,48 @@ pub enum ReconciliationAction {
     Duplicate,
     Stale,
     Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SequencerExecutionStatus {
+    Submitted,
+    Accepted,
+    Executed,
+    Rejected,
+    Pending,
+    Timeout,
+    Unknown,
+    Filled,
+}
+
+#[must_use]
+pub fn interpret_send_tx_response(response: &TxResponse) -> SequencerExecutionStatus {
+    if !response.success {
+        return SequencerExecutionStatus::Rejected;
+    }
+
+    let Some(data) = response.data.as_ref() else {
+        return SequencerExecutionStatus::Unknown;
+    };
+
+    match data
+        .status
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("executed") => SequencerExecutionStatus::Executed,
+        Some("rejected" | "reject" | "failed" | "error") => SequencerExecutionStatus::Rejected,
+        Some("pending") => SequencerExecutionStatus::Pending,
+        Some("timeout" | "timed_out") => SequencerExecutionStatus::Timeout,
+        Some("submitted") => SequencerExecutionStatus::Submitted,
+        Some("accepted") => SequencerExecutionStatus::Accepted,
+        Some(_) => SequencerExecutionStatus::Unknown,
+        None if data.code == Some(200) || data.tx_id.is_some() || data.order_index.is_some() => {
+            SequencerExecutionStatus::Accepted
+        }
+        None => SequencerExecutionStatus::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +111,11 @@ enum ReconciliationKey {
     Cancel {
         client_order_id: String,
         timestamp_ms: i64,
+    },
+    SendTx {
+        client_order_id: String,
+        timestamp_ms: i64,
+        status: SequencerExecutionStatus,
     },
     OrderUpdate {
         order_id: String,
@@ -99,6 +153,37 @@ impl ExecutionReconciler {
             None,
             market_index,
             ReconciledOrderStatus::Sent,
+            timestamp_ms,
+        )
+    }
+
+    pub fn record_send_tx_response(
+        &mut self,
+        client_order_id: impl Into<String>,
+        market_index: u16,
+        timestamp_ms: i64,
+        response: &TxResponse,
+    ) -> ReconciliationAction {
+        let client_order_id = client_order_id.into();
+        let status = interpret_send_tx_response(response);
+        let key = ReconciliationKey::SendTx {
+            client_order_id: client_order_id.clone(),
+            timestamp_ms,
+            status,
+        };
+        if !self.seen_events.insert(key) {
+            return ReconciliationAction::Duplicate;
+        }
+
+        self.upsert_order(
+            client_order_id,
+            response
+                .data
+                .as_ref()
+                .and_then(|data| data.order_index)
+                .map(|order_index| order_index.to_string()),
+            market_index,
+            reconciled_status_from_send_tx(status),
             timestamp_ms,
         )
     }
@@ -261,6 +346,20 @@ impl ExecutionReconciler {
     }
 }
 
+fn reconciled_status_from_send_tx(status: SequencerExecutionStatus) -> ReconciledOrderStatus {
+    match status {
+        SequencerExecutionStatus::Submitted => ReconciledOrderStatus::Submitted,
+        SequencerExecutionStatus::Accepted => ReconciledOrderStatus::Accepted,
+        SequencerExecutionStatus::Executed => ReconciledOrderStatus::Executed,
+        SequencerExecutionStatus::Rejected => ReconciledOrderStatus::Rejected,
+        SequencerExecutionStatus::Pending => ReconciledOrderStatus::Pending,
+        SequencerExecutionStatus::Timeout | SequencerExecutionStatus::Unknown => {
+            ReconciledOrderStatus::Timeout
+        }
+        SequencerExecutionStatus::Filled => ReconciledOrderStatus::Filled,
+    }
+}
+
 fn reconciled_status_from_dispatch(status: OrderDispatchStatus) -> ReconciledOrderStatus {
     match status {
         OrderDispatchStatus::Accepted => ReconciledOrderStatus::Accepted,
@@ -281,14 +380,37 @@ fn is_regressive(previous: ReconciledOrderStatus, next: ReconciledOrderStatus) -
         }
         ReconciledOrderStatus::PartiallyFilled => matches!(
             next,
-            ReconciledOrderStatus::Sent | ReconciledOrderStatus::Accepted
+            ReconciledOrderStatus::Sent
+                | ReconciledOrderStatus::Submitted
+                | ReconciledOrderStatus::Accepted
+                | ReconciledOrderStatus::Pending
+                | ReconciledOrderStatus::Timeout
         ),
         ReconciledOrderStatus::CancelRejected => matches!(
             next,
-            ReconciledOrderStatus::Sent | ReconciledOrderStatus::CancelPending
+            ReconciledOrderStatus::Sent
+                | ReconciledOrderStatus::Submitted
+                | ReconciledOrderStatus::CancelPending
         ),
-        ReconciledOrderStatus::CancelPending => matches!(next, ReconciledOrderStatus::Sent),
-        ReconciledOrderStatus::Accepted => matches!(next, ReconciledOrderStatus::Sent),
+        ReconciledOrderStatus::CancelPending => matches!(
+            next,
+            ReconciledOrderStatus::Sent | ReconciledOrderStatus::Submitted
+        ),
+        ReconciledOrderStatus::Timeout => matches!(next, ReconciledOrderStatus::Sent),
+        ReconciledOrderStatus::Pending => matches!(next, ReconciledOrderStatus::Sent),
+        ReconciledOrderStatus::Executed => matches!(
+            next,
+            ReconciledOrderStatus::Sent
+                | ReconciledOrderStatus::Submitted
+                | ReconciledOrderStatus::Accepted
+                | ReconciledOrderStatus::Pending
+                | ReconciledOrderStatus::Timeout
+        ),
+        ReconciledOrderStatus::Accepted => matches!(
+            next,
+            ReconciledOrderStatus::Sent | ReconciledOrderStatus::Submitted
+        ),
+        ReconciledOrderStatus::Submitted => matches!(next, ReconciledOrderStatus::Sent),
         ReconciledOrderStatus::Sent => false,
     }
 }

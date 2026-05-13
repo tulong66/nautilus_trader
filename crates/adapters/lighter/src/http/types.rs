@@ -358,10 +358,14 @@ pub struct CancelAllOrdersRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionResponse {
-    /// Transaction ID if successful.
+    /// Transaction ID if the sequencer accepted/submitted the transaction.
     pub tx_id: Option<String>,
-    /// Order index if order was created.
+    /// Order index if order creation was accepted by the sequencer.
     pub order_index: Option<i64>,
+    /// Sequencer result code. Code 200 indicates submission acceptance, not execution/fill.
+    pub code: Option<i64>,
+    /// Sequencer execution status when present.
+    pub status: Option<String>,
 }
 
 /// Convenience type alias for transaction response.
