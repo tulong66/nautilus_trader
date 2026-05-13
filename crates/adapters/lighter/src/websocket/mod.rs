@@ -17,8 +17,13 @@
 
 pub mod client;
 pub mod messages;
+pub mod transport;
 
 pub use client::LighterWebSocketClient;
 pub use messages::{
     InboundMessage, OutboundMessage, SubscriptionChannel, SubscriptionType, WebSocketError,
+};
+pub use transport::{
+    BoxWebSocketTransport, TungsteniteWebSocketConnector, TungsteniteWebSocketTransport,
+    WebSocketTransport, WebSocketTransportConnector,
 };

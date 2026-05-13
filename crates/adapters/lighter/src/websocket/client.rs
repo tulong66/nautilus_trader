@@ -23,16 +23,19 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    common::{LighterEnvironment, build_public_ws_url, build_private_ws_url},
+    common::{LighterEnvironment, build_private_ws_url, build_public_ws_url},
     error::LighterError,
-    websocket::messages::{InboundMessage, OutboundMessage, SubscriptionType},
+    websocket::{
+        messages::{InboundMessage, OutboundMessage, SubscriptionType},
+        transport::{
+            TungsteniteWebSocketConnector, WebSocketTransport, WebSocketTransportConnector,
+        },
+    },
 };
 
 /// Type alias for WebSocket result.
@@ -47,11 +50,10 @@ const DEFAULT_RECONNECT_DELAY_MS: u64 = 1000;
 /// Maximum reconnect delay in milliseconds.
 const MAX_RECONNECT_DELAY_MS: u64 = 30000;
 
-/// Type alias for the WebSocket write sink.
-type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
+enum WebSocketCommand {
+    Send(OutboundMessage),
+    Close,
+}
 
 /// WebSocket client for Lighter DEX.
 ///
@@ -76,8 +78,10 @@ pub struct LighterWebSocketClient {
     is_authenticated: Arc<AtomicBool>,
     /// Message sender.
     msg_tx: Arc<RwLock<Option<mpsc::UnboundedSender<InboundMessage>>>>,
-    /// WebSocket write handle for sending messages.
-    ws_write: Arc<tokio::sync::Mutex<Option<WsSink>>>,
+    /// Command sender for the connection loop.
+    command_tx: Arc<RwLock<Option<mpsc::UnboundedSender<WebSocketCommand>>>>,
+    /// Transport connector.
+    transport_connector: Arc<dyn WebSocketTransportConnector>,
     /// Background task handle.
     task_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -89,7 +93,10 @@ impl std::fmt::Debug for LighterWebSocketClient {
             .field("environment", &self.environment)
             .field("requires_auth", &self.requires_auth)
             .field("is_running", &self.is_running.load(Ordering::Relaxed))
-            .field("is_authenticated", &self.is_authenticated.load(Ordering::Relaxed))
+            .field(
+                "is_authenticated",
+                &self.is_authenticated.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -120,7 +127,8 @@ impl LighterWebSocketClient {
             is_running: Arc::new(AtomicBool::new(false)),
             is_authenticated: Arc::new(AtomicBool::new(false)),
             msg_tx: Arc::new(RwLock::new(None)),
-            ws_write: Arc::new(tokio::sync::Mutex::new(None)),
+            command_tx: Arc::new(RwLock::new(None)),
+            transport_connector: Arc::new(TungsteniteWebSocketConnector),
             task_handle: Arc::new(RwLock::new(None)),
         }
     }
@@ -152,16 +160,39 @@ impl LighterWebSocketClient {
             is_running: Arc::new(AtomicBool::new(false)),
             is_authenticated: Arc::new(AtomicBool::new(false)),
             msg_tx: Arc::new(RwLock::new(None)),
-            ws_write: Arc::new(tokio::sync::Mutex::new(None)),
+            command_tx: Arc::new(RwLock::new(None)),
+            transport_connector: Arc::new(TungsteniteWebSocketConnector),
+            task_handle: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn new_private_with_transport_connector(
+        environment: LighterEnvironment,
+        auth_token: String,
+        url: String,
+        heartbeat: Option<u64>,
+        transport_connector: Arc<dyn WebSocketTransportConnector>,
+    ) -> Self {
+        Self {
+            url,
+            environment,
+            requires_auth: true,
+            auth_token: Arc::new(RwLock::new(Some(auth_token))),
+            heartbeat_interval: heartbeat.unwrap_or(DEFAULT_HEARTBEAT_SECS),
+            subscriptions: Arc::new(RwLock::new(Vec::new())),
+            is_running: Arc::new(AtomicBool::new(false)),
+            is_authenticated: Arc::new(AtomicBool::new(false)),
+            msg_tx: Arc::new(RwLock::new(None)),
+            command_tx: Arc::new(RwLock::new(None)),
+            transport_connector,
             task_handle: Arc::new(RwLock::new(None)),
         }
     }
 
     fn resubscribe_messages(channels: &[String]) -> Vec<OutboundMessage> {
-        channels
-            .iter()
-            .map(OutboundMessage::subscribe)
-            .collect()
+        channels.iter().map(OutboundMessage::subscribe).collect()
     }
 
     /// Connect to the WebSocket endpoint.
@@ -179,7 +210,9 @@ impl LighterWebSocketClient {
         info!("Connecting to Lighter WebSocket: {}", self.url);
 
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         *self.msg_tx.write().await = Some(msg_tx.clone());
+        *self.command_tx.write().await = Some(command_tx);
 
         let url = self.url.clone();
         let requires_auth = self.requires_auth;
@@ -188,7 +221,9 @@ impl LighterWebSocketClient {
         let subscriptions = Arc::clone(&self.subscriptions);
         let is_running = Arc::clone(&self.is_running);
         let is_authenticated = Arc::clone(&self.is_authenticated);
-        let ws_write = Arc::clone(&self.ws_write);
+        let transport_connector = Arc::clone(&self.transport_connector);
+
+        self.is_running.store(true, Ordering::Relaxed);
 
         let handle = tokio::spawn(async move {
             Self::run_connection_loop(
@@ -200,13 +235,13 @@ impl LighterWebSocketClient {
                 is_running,
                 is_authenticated,
                 msg_tx,
-                ws_write,
+                command_rx,
+                transport_connector,
             )
             .await;
         });
 
         *self.task_handle.write().await = Some(handle);
-        self.is_running.store(true, Ordering::Relaxed);
 
         Ok(msg_rx)
     }
@@ -221,106 +256,45 @@ impl LighterWebSocketClient {
         is_running: Arc<AtomicBool>,
         is_authenticated: Arc<AtomicBool>,
         msg_tx: mpsc::UnboundedSender<InboundMessage>,
-        ws_write: Arc<tokio::sync::Mutex<Option<WsSink>>>,
+        mut command_rx: mpsc::UnboundedReceiver<WebSocketCommand>,
+        transport_connector: Arc<dyn WebSocketTransportConnector>,
     ) {
         let mut reconnect_delay = DEFAULT_RECONNECT_DELAY_MS;
 
         while is_running.load(Ordering::Relaxed) {
-            match connect_async(&url).await {
-                Ok((ws_stream, _)) => {
+            match transport_connector.connect(&url).await {
+                Ok(mut transport) => {
                     info!("WebSocket connected successfully");
-                    reconnect_delay = DEFAULT_RECONNECT_DELAY_MS; // Reset delay on successful connection
+                    reconnect_delay = DEFAULT_RECONNECT_DELAY_MS;
 
-                    let (mut write, mut read) = ws_stream.split();
-
-                    // Authenticate if required
-                    if requires_auth {
-                        if let Some(token) = auth_token.read().await.as_ref() {
-                            let auth_msg = OutboundMessage::Auth {
-                                token: token.clone(),
-                            };
-                            if let Ok(json) = auth_msg.to_json() {
-                                if let Err(e) = write.send(Message::Text(json.into())).await {
-                                    error!("Failed to send auth message: {}", e);
-                                    continue;
-                                }
-                                debug!("Authentication message sent");
-                            }
-                        } else {
-                            error!("Authentication required but no token provided");
-                            break;
-                        }
+                    if let Err(e) =
+                        Self::send_initial_auth(requires_auth, &auth_token, transport.as_mut())
+                            .await
+                    {
+                        error!("Failed to authenticate WebSocket session: {}", e);
+                        break;
                     }
 
-                    // Resubscribe to previous subscriptions (one by one)
                     let subs = subscriptions.read().await.clone();
-                    for (channel, sub_msg) in subs.iter().zip(Self::resubscribe_messages(&subs)) {
-                        if let Ok(json) = sub_msg.to_json() {
-                            if let Err(e) = write.send(Message::Text(json.into())).await {
-                                error!("Failed to resubscribe to {}: {}", channel, e);
-                                continue;
-                            }
-                            debug!("Resubscribed to channel: {}", channel);
-                        }
+                    if let Err(e) =
+                        Self::send_subscription_channels(transport.as_mut(), &subs).await
+                    {
+                        error!("Failed to resubscribe WebSocket session: {}", e);
+                        break;
                     }
 
-                    // Store write handle in shared state for external access
-                    *ws_write.lock().await = Some(write);
+                    Self::run_session_loop(
+                        transport.as_mut(),
+                        requires_auth,
+                        heartbeat_interval,
+                        &is_running,
+                        &is_authenticated,
+                        &msg_tx,
+                        &mut command_rx,
+                    )
+                    .await;
 
-                    // Start heartbeat task using shared write handle
-                    let heartbeat_handle = {
-                        let ws_write_clone = Arc::clone(&ws_write);
-                        let is_running = Arc::clone(&is_running);
-                        tokio::spawn(async move {
-                            Self::heartbeat_loop_shared(ws_write_clone, heartbeat_interval, is_running).await;
-                        })
-                    };
-
-                    // Process incoming messages
-                    while let Some(msg_result) = read.next().await {
-                        if !is_running.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-                        match msg_result {
-                            Ok(Message::Text(text)) => {
-                                match Self::parse_message(&text, requires_auth, &is_authenticated) {
-                                    Ok(parsed_msg) => {
-                                        if msg_tx.send(parsed_msg).is_err() {
-                                            warn!("Message receiver dropped, stopping client");
-                                            is_running.store(false, Ordering::Relaxed);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to parse message: {}", e);
-                                    }
-                                }
-                            }
-                            Ok(Message::Pong(_)) => {
-                                debug!("Received pong");
-                                if msg_tx.send(InboundMessage::Pong).is_err() {
-                                    warn!("Message receiver dropped, stopping client");
-                                    is_running.store(false, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-                            Ok(Message::Close(_)) => {
-                                info!("WebSocket closed by server");
-                                break;
-                            }
-                            Ok(_) => {
-                                debug!("Received non-text message");
-                            }
-                            Err(e) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Cleanup
-                    heartbeat_handle.abort();
+                    let _ = transport.close().await;
                     info!("WebSocket connection closed");
                 }
                 Err(e) => {
@@ -328,15 +302,9 @@ impl LighterWebSocketClient {
                 }
             }
 
-            // Reconnect logic
             if is_running.load(Ordering::Relaxed) {
-                warn!(
-                    "Reconnecting in {} ms...",
-                    reconnect_delay
-                );
+                warn!("Reconnecting in {} ms...", reconnect_delay);
                 tokio::time::sleep(Duration::from_millis(reconnect_delay)).await;
-
-                // Exponential backoff
                 reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_MS);
             }
         }
@@ -344,29 +312,114 @@ impl LighterWebSocketClient {
         info!("WebSocket client stopped");
     }
 
-    /// Heartbeat loop using shared optional write handle.
-    async fn heartbeat_loop_shared(
-        ws_write: Arc<tokio::sync::Mutex<Option<WsSink>>>,
-        interval_secs: u64,
-        is_running: Arc<AtomicBool>,
+    async fn send_initial_auth(
+        requires_auth: bool,
+        auth_token: &Arc<RwLock<Option<String>>>,
+        transport: &mut dyn WebSocketTransport,
+    ) -> LighterWsResult<()> {
+        if !requires_auth {
+            return Ok(());
+        }
+
+        let token = auth_token.read().await.clone().ok_or_else(|| {
+            LighterError::Auth("Authentication required but no token provided".to_string())
+        })?;
+        Self::send_outbound_message(transport, OutboundMessage::Auth { token }, "auth").await?;
+        debug!("Authentication message sent");
+        Ok(())
+    }
+
+    async fn send_subscription_channels(
+        transport: &mut dyn WebSocketTransport,
+        channels: &[String],
+    ) -> LighterWsResult<()> {
+        for (channel, sub_msg) in channels.iter().zip(Self::resubscribe_messages(channels)) {
+            Self::send_outbound_message(transport, sub_msg, "subscribe").await?;
+            debug!("Sent subscription for channel: {}", channel);
+        }
+        Ok(())
+    }
+
+    async fn send_outbound_message(
+        transport: &mut dyn WebSocketTransport,
+        message: OutboundMessage,
+        operation: &str,
+    ) -> LighterWsResult<()> {
+        let json = message.to_json().map_err(|e| {
+            LighterError::WebSocket(format!("Failed to serialize {operation}: {e}"))
+        })?;
+        transport.send_text(json).await.map_err(|e| {
+            LighterError::WebSocket(format!("Failed to send {operation} message: {e}"))
+        })
+    }
+
+    async fn run_session_loop(
+        transport: &mut dyn WebSocketTransport,
+        requires_auth: bool,
+        heartbeat_interval: u64,
+        is_running: &Arc<AtomicBool>,
+        is_authenticated: &Arc<AtomicBool>,
+        msg_tx: &mpsc::UnboundedSender<InboundMessage>,
+        command_rx: &mut mpsc::UnboundedReceiver<WebSocketCommand>,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_interval.max(1)));
+        heartbeat.tick().await;
 
-        while is_running.load(Ordering::Relaxed) {
-            interval.tick().await;
+        loop {
+            if !is_running.load(Ordering::Relaxed) {
+                break;
+            }
 
-            let ping_msg = OutboundMessage::Ping;
-            if let Ok(json) = ping_msg.to_json() {
-                let mut write_guard = ws_write.lock().await;
-                if let Some(write) = write_guard.as_mut() {
-                    if let Err(e) = write.send(Message::Text(json.into())).await {
+            tokio::select! {
+                command = command_rx.recv() => {
+                    match command {
+                        Some(WebSocketCommand::Send(message)) => {
+                            if let Err(e) = Self::send_outbound_message(transport, message, "command").await {
+                                error!("Failed to send WebSocket command: {}", e);
+                                break;
+                            }
+                        }
+                        Some(WebSocketCommand::Close) => {
+                            is_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        None => {
+                            warn!("WebSocket command channel closed");
+                            is_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(e) = Self::send_outbound_message(transport, OutboundMessage::Ping, "ping").await {
                         error!("Failed to send ping: {}", e);
                         break;
                     }
                     debug!("Sent ping");
-                } else {
-                    warn!("WebSocket write handle not available for ping");
-                    break;
+                }
+                frame = transport.recv_text() => {
+                    match frame {
+                        Ok(Some(text)) => {
+                            match Self::parse_message(&text, requires_auth, is_authenticated) {
+                                Ok(parsed_msg) => {
+                                    if msg_tx.send(parsed_msg).is_err() {
+                                        warn!("Message receiver dropped, stopping client");
+                                        is_running.store(false, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                Err(e) => warn!("Failed to parse message: {}", e),
+                            }
+                        }
+                        Ok(None) => {
+                            info!("WebSocket transport closed by peer");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("WebSocket transport receive error: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -415,7 +468,9 @@ impl LighterWebSocketClient {
     /// Returns an error if subscription fails or client is not connected.
     pub async fn subscribe(&self, subscriptions: Vec<SubscriptionType>) -> LighterWsResult<()> {
         if !self.is_running.load(Ordering::Relaxed) {
-            return Err(LighterError::WebSocket("Client is not connected".to_string()));
+            return Err(LighterError::WebSocket(
+                "Client is not connected".to_string(),
+            ));
         }
 
         // Check authentication for private channels
@@ -430,54 +485,21 @@ impl LighterWebSocketClient {
         }
 
         let channels: Vec<String> = subscriptions.iter().map(|s| s.to_channel()).collect();
+        let command_tx = self.command_tx.read().await.clone().ok_or_else(|| {
+            LighterError::WebSocket("WebSocket command channel not ready".to_string())
+        })?;
 
-        // Wait for WebSocket connection to be established (up to 5 seconds)
-        let mut retries = 0;
-        const MAX_RETRIES: u32 = 50;
-        const RETRY_DELAY_MS: u64 = 100;
-
-        loop {
-            {
-                let mut write_guard = self.ws_write.lock().await;
-                if let Some(write) = write_guard.as_mut() {
-                    // Send subscription messages
-                    for channel in &channels {
-                        let sub_msg = OutboundMessage::subscribe(channel);
-                        if let Ok(json) = sub_msg.to_json() {
-                            if let Err(e) = write.send(Message::Text(json.into())).await {
-                                error!("Failed to subscribe to {}: {}", channel, e);
-                                return Err(LighterError::WebSocket(format!(
-                                    "Failed to subscribe to {}: {}", channel, e
-                                )));
-                            }
-                            debug!("Sent subscription for channel: {}", channel);
-                        }
-                    }
-                    break;
-                }
-            }
-
-            retries += 1;
-            if retries >= MAX_RETRIES {
-                return Err(LighterError::WebSocket(
-                    "WebSocket connection not ready after timeout".to_string(),
-                ));
-            }
-
-            // Wait a bit before retrying
-            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-
-            // Check if still running
-            if !self.is_running.load(Ordering::Relaxed) {
-                return Err(LighterError::WebSocket("Client disconnected while waiting".to_string()));
-            }
+        for channel in &channels {
+            command_tx
+                .send(WebSocketCommand::Send(OutboundMessage::subscribe(channel)))
+                .map_err(|_| {
+                    LighterError::WebSocket("WebSocket command channel closed".to_string())
+                })?;
+            debug!("Queued subscription for channel: {}", channel);
         }
 
-        // Add to subscriptions list for reconnection
         self.subscriptions.write().await.extend(channels.clone());
-
         debug!("Subscribed to {} channels", channels.len());
-
         Ok(())
     }
 
@@ -488,26 +510,23 @@ impl LighterWebSocketClient {
     /// Returns an error if unsubscription fails or client is not connected.
     pub async fn unsubscribe(&self, subscriptions: Vec<SubscriptionType>) -> LighterWsResult<()> {
         if !self.is_running.load(Ordering::Relaxed) {
-            return Err(LighterError::WebSocket("Client is not connected".to_string()));
+            return Err(LighterError::WebSocket(
+                "Client is not connected".to_string(),
+            ));
         }
 
         let channels: Vec<String> = subscriptions.iter().map(|s| s.to_channel()).collect();
 
-        // Send unsubscription messages via WebSocket
-        {
-            let mut write_guard = self.ws_write.lock().await;
-            if let Some(write) = write_guard.as_mut() {
-                for channel in &channels {
-                    let unsub_msg = OutboundMessage::unsubscribe(channel);
-                    if let Ok(json) = unsub_msg.to_json() {
-                        if let Err(e) = write.send(Message::Text(json.into())).await {
-                            error!("Failed to unsubscribe from {}: {}", channel, e);
-                            // Continue with other unsubscriptions even if one fails
-                        } else {
-                            debug!("Sent unsubscription for channel: {}", channel);
-                        }
-                    }
-                }
+        if let Some(command_tx) = self.command_tx.read().await.clone() {
+            for channel in &channels {
+                command_tx
+                    .send(WebSocketCommand::Send(OutboundMessage::unsubscribe(
+                        channel,
+                    )))
+                    .map_err(|_| {
+                        LighterError::WebSocket("WebSocket command channel closed".to_string())
+                    })?;
+                debug!("Queued unsubscription for channel: {}", channel);
             }
         }
 
@@ -530,6 +549,10 @@ impl LighterWebSocketClient {
 
         self.is_running.store(false, Ordering::Relaxed);
         self.is_authenticated.store(false, Ordering::Relaxed);
+
+        if let Some(command_tx) = self.command_tx.write().await.take() {
+            let _ = command_tx.send(WebSocketCommand::Close);
+        }
 
         // Abort background task
         if let Some(handle) = self.task_handle.write().await.take() {
@@ -579,25 +602,31 @@ impl LighterWebSocketClient {
     ///
     /// Returns an error if subscription fails or client is not connected.
     pub async fn subscribe_account(&self, _account_index: i64) -> LighterWsResult<()> {
-        self.subscribe(vec![
-            SubscriptionType::Account,
-            SubscriptionType::Orders,
-        ])
-        .await
+        self.subscribe(vec![SubscriptionType::Account, SubscriptionType::Orders])
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::{
+        execution::{
+            dispatch::{DispatchOutcome, OrderDispatchStatus, dispatch_private_message},
+            fixtures::{OrderFixtureStatus, execution_fixture_set},
+        },
+        websocket::transport::{
+            ScriptedWebSocketAction, ScriptedWebSocketConnector, ScriptedWebSocketTransport,
+            WebSocketTransport,
+        },
+    };
 
     #[test]
     fn test_new_public_client() {
-        let client = LighterWebSocketClient::new_public(
-            LighterEnvironment::Testnet,
-            None,
-            Some(30),
-        );
+        let client =
+            LighterWebSocketClient::new_public(LighterEnvironment::Testnet, None, Some(30));
 
         assert!(!client.requires_auth);
         assert!(!client.is_running());
@@ -624,11 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscription_management() {
-        let client = LighterWebSocketClient::new_public(
-            LighterEnvironment::Testnet,
-            None,
-            None,
-        );
+        let client = LighterWebSocketClient::new_public(LighterEnvironment::Testnet, None, None);
 
         let subs = vec![
             SubscriptionType::Orderbook { market_index: 1 },
@@ -659,5 +684,164 @@ mod tests {
         assert!(json[0].contains("order_book/1"));
         assert!(json[1].contains("trade/1"));
         assert!(json[2].contains("market_stats/1"));
+    }
+
+    #[tokio::test]
+    async fn scripted_transport_records_outbound_and_replays_inbound_text() {
+        let (mut transport, probe) = ScriptedWebSocketTransport::new(vec![
+            ScriptedWebSocketAction::ExpectSendContains("\"type\":\"ping\""),
+            ScriptedWebSocketAction::RecvText(r#"{"type":"auth_success"}"#.to_string()),
+            ScriptedWebSocketAction::Close,
+        ]);
+
+        transport
+            .send_text(r#"{"type":"ping"}"#.to_string())
+            .await
+            .expect("scripted send");
+
+        assert_eq!(probe.sent_texts(), vec![r#"{"type":"ping"}"#.to_string()]);
+        assert_eq!(
+            transport
+                .recv_text()
+                .await
+                .expect("scripted recv")
+                .as_deref(),
+            Some(r#"{"type":"auth_success"}"#)
+        );
+        assert!(
+            transport
+                .recv_text()
+                .await
+                .expect("scripted close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn private_ws_dry_run_uses_scripted_transport_for_auth_subscribe_and_dispatch() {
+        let fixtures = execution_fixture_set();
+        let filled_order = fixtures
+            .orders
+            .iter()
+            .find(|order| order.status == OrderFixtureStatus::Filled)
+            .expect("filled fixture");
+
+        let order_json = format!(
+            r#"{{"type":"update/account_all_orders","channel":"account_all_orders:42","order":{{"order_id":"{}","client_order_id":"{}","market_index":{},"status":"{}","side":"{}","order_type":"{}","price":"{}","quantity":"{}","filled_quantity":"{}","timestamp":{}}}}}"#,
+            filled_order.order_id,
+            filled_order.client_order_id,
+            filled_order.market_index,
+            filled_order.status.as_lighter_status(),
+            filled_order.side,
+            filled_order.order_type,
+            filled_order.price,
+            filled_order.quantity,
+            filled_order.filled_quantity,
+            filled_order.timestamp_ms,
+        );
+        let account_json = format!(
+            r#"{{"type":"update/account_all","channel":"account_all:42","account":{{"account_index":{},"address":"{}","balances":{{"{}":"{}"}}}},"timestamp":{}}}"#,
+            fixtures.account.account_index,
+            fixtures.account.address,
+            fixtures.account.asset,
+            fixtures.account.balance,
+            fixtures.account.timestamp_ms,
+        );
+
+        let (transport, probe) = ScriptedWebSocketTransport::new(vec![
+            ScriptedWebSocketAction::ExpectSendContains("\"type\":\"auth\""),
+            ScriptedWebSocketAction::RecvText(r#"{"type":"auth_success"}"#.to_string()),
+            ScriptedWebSocketAction::ExpectSendContains("account_all"),
+            ScriptedWebSocketAction::ExpectSendContains("account_all_orders"),
+            ScriptedWebSocketAction::RecvText(
+                r#"{"type":"subscribed/account_all","channel":"account_all"}"#.to_string(),
+            ),
+            ScriptedWebSocketAction::RecvText(
+                r#"{"type":"subscribed/account_all_orders","channel":"account_all_orders"}"#
+                    .to_string(),
+            ),
+            ScriptedWebSocketAction::RecvText(order_json),
+            ScriptedWebSocketAction::RecvText(account_json),
+            ScriptedWebSocketAction::Close,
+        ]);
+
+        let connector = ScriptedWebSocketConnector::new(transport);
+        let mut client = LighterWebSocketClient::new_private_with_transport_connector(
+            LighterEnvironment::Testnet,
+            "fixture-auth-token".to_string(),
+            "scripted://lighter-private".to_string(),
+            Some(60),
+            connector,
+        );
+
+        let mut rx = client.connect().await.expect("connect scripted client");
+
+        let auth = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("auth message timeout")
+            .expect("auth message");
+        assert!(matches!(auth, InboundMessage::AuthSuccess));
+        assert!(client.is_authenticated());
+
+        client
+            .subscribe_account(42)
+            .await
+            .expect("subscribe account channels");
+
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            received.push(
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("private message timeout")
+                    .expect("private message"),
+            );
+        }
+
+        assert!(received.iter().any(|message| matches!(
+            message,
+            InboundMessage::SubscriptionSuccess { channel } if channel == "account_all"
+        )));
+        assert!(received.iter().any(|message| matches!(
+            message,
+            InboundMessage::SubscriptionSuccess { channel } if channel == "account_all_orders"
+        )));
+
+        let order_message = received
+            .iter()
+            .find(|message| matches!(message, InboundMessage::OrderUpdate { .. }))
+            .expect("order update");
+        let account_message = received
+            .iter()
+            .find(|message| matches!(message, InboundMessage::AccountUpdate { .. }))
+            .expect("account update");
+
+        assert_eq!(
+            dispatch_private_message(order_message),
+            DispatchOutcome::Order {
+                order_id: filled_order.order_id.to_string(),
+                client_order_id: Some(filled_order.client_order_id.to_string()),
+                market_index: filled_order.market_index,
+                status: OrderDispatchStatus::Filled,
+                venue_status: "filled".to_string(),
+            }
+        );
+        assert_eq!(
+            dispatch_private_message(account_message),
+            DispatchOutcome::Account {
+                address: fixtures.account.address,
+                balances: vec![(fixtures.account.asset, fixtures.account.balance)],
+                timestamp_ms: fixtures.account.timestamp_ms,
+            }
+        );
+
+        let sent = probe.sent_texts();
+        assert_eq!(sent.len(), 3);
+        assert!(sent[0].contains("\"type\":\"auth\""));
+        assert!(sent[0].contains("fixture-auth-token"));
+        assert!(sent.iter().any(|text| text.contains("account_all")));
+        assert!(sent.iter().any(|text| text.contains("account_all_orders")));
+
+        client.close().await.expect("close scripted client");
     }
 }

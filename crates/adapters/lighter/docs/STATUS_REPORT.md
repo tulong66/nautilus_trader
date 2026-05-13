@@ -56,11 +56,13 @@
 > 安全边界：继续保持 no-withdraw/no-transfer signing surface；不读取 `.env`、wallet、key 文件；不调用 Lighter mainnet 下单；不使用真实 private WS credentials；不运行任何真实资金命令。
 >
 > 并行策略：J 是安全前置；K/L/M/N/O/P/Q 可在 J 后并行推进；R 依赖 J-Q 的验证结果收尾。若某项发现必须触碰认证、私钥、真实账号、真实下单、提现、授权或部署，立即停止并升级为人工决策。
+>
+> WebSocket transport Roadmap：P2-K/R 按 `docs/plans/2026-05-lighter-ws-transport-roadmap/` 推进；当前实施目标是 B-core（transport abstraction + scripted dry-run），最终目标是 B-full（reconnect/replay/fault-injection/soak/reconciliation）。
 
 | ID | 任务 | 状态 | 可并行性 | 验收标准 |
 |----|------|------|----------|----------|
 | J | Signer wrapper / capability whitelist / stage gate：把 create order / cancel order / cancel all / auth token 之外的签名能力从策略路径硬隔离 | [x] | 前置 | `LighterExecClientConfig.enable_live_signing` 默认关闭；`LighterExecutionClient` 只持有 `LighterStrategySigner` wrapper；`connect()` 在任何 HTTP/private WS/auth token 前拒绝默认配置；tests 覆盖 denied surface、disabled gate、explicit opt-in；无 env/key/secret 读取 |
-| K | Private WS/auth dry-run harness：建立可注入 token/auth stub 与 private channel 订阅重放测试 | [ ] | J 后可并行 | 使用 fixture/stub 验证 auth/subscription/order/account message flow；不读取 `.env`；不连接真实 private WS |
+| K | Private WS/auth dry-run harness：建立可注入 token/auth stub 与 private channel 订阅重放测试 | [x] | J 后可并行 | B-core 已建立 WebSocket transport abstraction；live transport 仍走 `tokio_tungstenite`，dry-run 使用 scripted transport；tests 覆盖 stub auth、account/orders subscription、fixture order/account replay、parse + dispatch；不读取 `.env`；不连接真实 private WS；Roadmap 保存在 `docs/plans/2026-05-lighter-ws-transport-roadmap/` |
 | L | Live report API 设计与 mock server 接入：为 order/fill/position/mass report 设计真实数据来源接口，但只用 mock server 验证 | [ ] | J 后可并行 | 默认 live 路径仍受 stage gate 保护；mock REST/WS 能返回确定性 reports；空结果/错误/分页语义有测试 |
 | M | Execution state reconciliation：建立 send/order update/account update/fill/cancel/cancel-reject 的状态机与去重规则 | [ ] | J 后可并行 | fixture/replay 覆盖 partial fill、filled、canceled、cancel rejected、重复消息、乱序消息；不产生真实订单 |
 | N | Sequencer 与 `sendTx` 语义建模：区分 accepted/submitted/executed/rejected，处理 `code=200` 但未 executed 的状态 | [ ] | J 后可并行 | mock response 覆盖 sequencer reject、timeout、pending、executed、`code=200 != executed`；不会把 submitted 误报为 filled |
