@@ -1,0 +1,294 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+use std::collections::{HashMap, HashSet};
+
+use crate::execution::dispatch::{DispatchOutcome, OrderDispatchStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReconciledOrderStatus {
+    Sent,
+    Accepted,
+    PartiallyFilled,
+    Filled,
+    CancelPending,
+    Canceled,
+    Rejected,
+    CancelRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReconciliationAction {
+    Accepted,
+    Duplicate,
+    Stale,
+    Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconciledOrderState {
+    status: ReconciledOrderStatus,
+    market_index: u16,
+    last_timestamp_ms: i64,
+    venue_order_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionReconciler {
+    orders: HashMap<String, ReconciledOrderState>,
+    venue_to_client: HashMap<String, String>,
+    seen_events: HashSet<ReconciliationKey>,
+    accounts: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReconciliationKey {
+    Send {
+        client_order_id: String,
+        timestamp_ms: i64,
+    },
+    Cancel {
+        client_order_id: String,
+        timestamp_ms: i64,
+    },
+    OrderUpdate {
+        order_id: String,
+        client_order_id: Option<String>,
+        status: OrderDispatchStatus,
+        timestamp_ms: i64,
+    },
+    Fill {
+        trade_id: String,
+    },
+    Account {
+        address: String,
+        timestamp_ms: i64,
+    },
+}
+
+impl ExecutionReconciler {
+    pub fn record_send(
+        &mut self,
+        client_order_id: impl Into<String>,
+        market_index: u16,
+        timestamp_ms: i64,
+    ) -> ReconciliationAction {
+        let client_order_id = client_order_id.into();
+        let key = ReconciliationKey::Send {
+            client_order_id: client_order_id.clone(),
+            timestamp_ms,
+        };
+        if !self.seen_events.insert(key) {
+            return ReconciliationAction::Duplicate;
+        }
+
+        self.upsert_order(
+            client_order_id,
+            None,
+            market_index,
+            ReconciledOrderStatus::Sent,
+            timestamp_ms,
+        )
+    }
+
+    pub fn record_cancel_request(
+        &mut self,
+        client_order_id: impl Into<String>,
+        market_index: u16,
+        timestamp_ms: i64,
+    ) -> ReconciliationAction {
+        let client_order_id = client_order_id.into();
+        let key = ReconciliationKey::Cancel {
+            client_order_id: client_order_id.clone(),
+            timestamp_ms,
+        };
+        if !self.seen_events.insert(key) {
+            return ReconciliationAction::Duplicate;
+        }
+
+        self.upsert_order(
+            client_order_id,
+            None,
+            market_index,
+            ReconciledOrderStatus::CancelPending,
+            timestamp_ms,
+        )
+    }
+
+    pub fn record_fill(
+        &mut self,
+        trade_id: impl Into<String>,
+        venue_order_id: impl Into<String>,
+        client_order_id: Option<impl Into<String>>,
+        market_index: u16,
+        timestamp_ms: i64,
+    ) -> ReconciliationAction {
+        let trade_id = trade_id.into();
+        let key = ReconciliationKey::Fill { trade_id };
+        if !self.seen_events.insert(key) {
+            return ReconciliationAction::Duplicate;
+        }
+
+        let venue_order_id = venue_order_id.into();
+        let client_order_id = client_order_id
+            .map(Into::into)
+            .or_else(|| self.venue_to_client.get(&venue_order_id).cloned())
+            .unwrap_or_else(|| venue_order_id.clone());
+
+        self.upsert_order(
+            client_order_id,
+            Some(venue_order_id),
+            market_index,
+            ReconciledOrderStatus::Filled,
+            timestamp_ms,
+        )
+    }
+
+    pub fn apply_dispatch(&mut self, outcome: &DispatchOutcome) -> ReconciliationAction {
+        match outcome {
+            DispatchOutcome::Order {
+                order_id,
+                client_order_id,
+                market_index,
+                status,
+                timestamp_ms,
+                ..
+            } => {
+                let key = ReconciliationKey::OrderUpdate {
+                    order_id: order_id.clone(),
+                    client_order_id: client_order_id.clone(),
+                    status: *status,
+                    timestamp_ms: *timestamp_ms,
+                };
+                if !self.seen_events.insert(key) {
+                    return ReconciliationAction::Duplicate;
+                }
+
+                let client_order_id = client_order_id
+                    .clone()
+                    .or_else(|| self.venue_to_client.get(order_id).cloned())
+                    .unwrap_or_else(|| order_id.clone());
+                self.upsert_order(
+                    client_order_id,
+                    Some(order_id.clone()),
+                    *market_index,
+                    reconciled_status_from_dispatch(*status),
+                    *timestamp_ms,
+                )
+            }
+            DispatchOutcome::Account {
+                address,
+                timestamp_ms,
+                ..
+            } => {
+                let key = ReconciliationKey::Account {
+                    address: address.clone(),
+                    timestamp_ms: *timestamp_ms,
+                };
+                if !self.seen_events.insert(key) {
+                    return ReconciliationAction::Duplicate;
+                }
+                match self.accounts.get(address) {
+                    Some(previous) if *previous > *timestamp_ms => ReconciliationAction::Stale,
+                    _ => {
+                        self.accounts.insert(address.clone(), *timestamp_ms);
+                        ReconciliationAction::Accepted
+                    }
+                }
+            }
+            DispatchOutcome::Ignored => ReconciliationAction::Ignored,
+        }
+    }
+
+    #[must_use]
+    pub fn order_status(&self, client_order_id: &str) -> Option<ReconciledOrderStatus> {
+        self.orders.get(client_order_id).map(|state| state.status)
+    }
+
+    #[must_use]
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    #[must_use]
+    pub fn account_timestamp(&self, address: &str) -> Option<i64> {
+        self.accounts.get(address).copied()
+    }
+
+    fn upsert_order(
+        &mut self,
+        client_order_id: String,
+        venue_order_id: Option<String>,
+        market_index: u16,
+        next_status: ReconciledOrderStatus,
+        timestamp_ms: i64,
+    ) -> ReconciliationAction {
+        let previous = self.orders.get(&client_order_id).cloned();
+        if let Some(previous) = previous.as_ref() {
+            if timestamp_ms < previous.last_timestamp_ms {
+                return ReconciliationAction::Stale;
+            }
+            if is_regressive(previous.status, next_status) {
+                return ReconciliationAction::Stale;
+            }
+        }
+
+        if let Some(venue_order_id) = venue_order_id.as_ref() {
+            self.venue_to_client
+                .insert(venue_order_id.clone(), client_order_id.clone());
+        }
+
+        let state = ReconciledOrderState {
+            status: next_status,
+            market_index,
+            last_timestamp_ms: timestamp_ms,
+            venue_order_id,
+        };
+        self.orders.insert(client_order_id, state);
+        ReconciliationAction::Accepted
+    }
+}
+
+fn reconciled_status_from_dispatch(status: OrderDispatchStatus) -> ReconciledOrderStatus {
+    match status {
+        OrderDispatchStatus::Accepted => ReconciledOrderStatus::Accepted,
+        OrderDispatchStatus::Rejected => ReconciledOrderStatus::Rejected,
+        OrderDispatchStatus::PartiallyFilled => ReconciledOrderStatus::PartiallyFilled,
+        OrderDispatchStatus::Filled => ReconciledOrderStatus::Filled,
+        OrderDispatchStatus::Canceled => ReconciledOrderStatus::Canceled,
+        OrderDispatchStatus::CancelRejected => ReconciledOrderStatus::CancelRejected,
+    }
+}
+
+fn is_regressive(previous: ReconciledOrderStatus, next: ReconciledOrderStatus) -> bool {
+    match previous {
+        ReconciledOrderStatus::Filled
+        | ReconciledOrderStatus::Canceled
+        | ReconciledOrderStatus::Rejected => {
+            !matches!(previous, ReconciledOrderStatus::CancelRejected) && previous != next
+        }
+        ReconciledOrderStatus::PartiallyFilled => matches!(
+            next,
+            ReconciledOrderStatus::Sent | ReconciledOrderStatus::Accepted
+        ),
+        ReconciledOrderStatus::CancelRejected => matches!(
+            next,
+            ReconciledOrderStatus::Sent | ReconciledOrderStatus::CancelPending
+        ),
+        ReconciledOrderStatus::CancelPending => matches!(next, ReconciledOrderStatus::Sent),
+        ReconciledOrderStatus::Accepted => matches!(next, ReconciledOrderStatus::Sent),
+        ReconciledOrderStatus::Sent => false,
+    }
+}

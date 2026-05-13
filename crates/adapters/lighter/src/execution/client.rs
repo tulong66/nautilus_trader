@@ -54,6 +54,7 @@ use crate::{
     execution::{
         dispatch::dispatch_private_message,
         fixtures::execution_fixture_set,
+        reconciliation::{ExecutionReconciler, ReconciliationAction},
         reports::{
             build_fill_report, build_mass_status, build_order_status_report,
             build_position_status_report,
@@ -481,6 +482,8 @@ pub struct LighterExecutionClient {
     instrument_to_market_index: DashMap<InstrumentId, u16>,
     /// Order state cache (ClientOrderId -> OrderState).
     orders: DashMap<ClientOrderId, OrderState>,
+    /// Reconciled execution state for send/order/fill/cancel/account replay.
+    reconciler: Arc<Mutex<ExecutionReconciler>>,
     /// Client started flag.
     started: bool,
     /// Client connected flag.
@@ -597,6 +600,7 @@ impl LighterExecutionClient {
             instruments: DashMap::new(),
             instrument_to_market_index: DashMap::new(),
             orders: DashMap::new(),
+            reconciler: Arc::new(Mutex::new(ExecutionReconciler::default())),
             started: false,
             connected: false,
             instruments_initialized: false,
@@ -818,6 +822,7 @@ impl LighterExecutionClient {
         mut msg_rx: tokio::sync::mpsc::UnboundedReceiver<InboundMessage>,
     ) {
         let orders = self.orders.clone();
+        let reconciler = self.reconciler.clone();
         let core_client_id = self.core.client_id;
         let core_account_id = self.core.account_id;
 
@@ -833,6 +838,7 @@ impl LighterExecutionClient {
                         if let Err(e) = Self::process_ws_message(
                             message,
                             &orders,
+                            &reconciler,
                             core_client_id,
                             core_account_id,
                         ) {
@@ -860,6 +866,7 @@ impl LighterExecutionClient {
     fn process_ws_message(
         message: InboundMessage,
         orders: &DashMap<ClientOrderId, OrderState>,
+        reconciler: &Arc<Mutex<ExecutionReconciler>>,
         client_id: ClientId,
         account_id: AccountId,
     ) -> Result<(), LighterError> {
@@ -874,7 +881,23 @@ impl LighterExecutionClient {
                 market_index,
                 ref status,
                 ref venue_status,
+                ..
             } => {
+                let reconciliation_action = reconciler
+                    .lock()
+                    .expect(MUTEX_POISONED)
+                    .apply_dispatch(&outcome);
+                if matches!(
+                    reconciliation_action,
+                    ReconciliationAction::Duplicate | ReconciliationAction::Stale
+                ) {
+                    debug!(
+                        "[{}] Ignoring {:?} order update for {}",
+                        client_id, reconciliation_action, order_id
+                    );
+                    return Ok(());
+                }
+
                 // Preserve existing order-cache side-effect: hydrate venue_order_id.
                 if let Some(coid_str) = client_order_id {
                     if let Ok(coid) = ClientOrderId::new_checked(coid_str) {
@@ -901,6 +924,21 @@ impl LighterExecutionClient {
                 ref balances,
                 ..
             } => {
+                let reconciliation_action = reconciler
+                    .lock()
+                    .expect(MUTEX_POISONED)
+                    .apply_dispatch(&outcome);
+                if matches!(
+                    reconciliation_action,
+                    ReconciliationAction::Duplicate | ReconciliationAction::Stale
+                ) {
+                    debug!(
+                        "[{}] Ignoring {:?} account update for {}",
+                        account_id, reconciliation_action, address
+                    );
+                    return Ok(());
+                }
+
                 info!(
                     "[{}] Account {} updated with {} balance entries",
                     account_id,
@@ -1159,6 +1197,11 @@ impl ExecutionClient for LighterExecutionClient {
             nonce,
         };
         self.orders.insert(order.client_order_id(), order_state);
+        self.reconciler.lock().expect(MUTEX_POISONED).record_send(
+            order.client_order_id().to_string(),
+            market_index,
+            cmd.ts_init.as_i64() / 1_000_000,
+        );
 
         // Build HTTP request
         let request = CreateOrderRequest {
@@ -1272,6 +1315,15 @@ impl ExecutionClient for LighterExecutionClient {
                     return Ok(());
                 }
             };
+
+        self.reconciler
+            .lock()
+            .expect(MUTEX_POISONED)
+            .record_cancel_request(
+                cmd.client_order_id.to_string(),
+                market_index,
+                cmd.ts_init.as_i64() / 1_000_000,
+            );
 
         // Build HTTP request
         let request = CancelOrderRequest {
@@ -1709,6 +1761,7 @@ mod tests {
             .expect("accepted order fixture");
         let client_order_id = ClientOrderId::new(accepted.client_order_id);
         let orders = DashMap::new();
+        let reconciler = Arc::new(Mutex::new(ExecutionReconciler::default()));
         orders.insert(
             client_order_id,
             OrderState {
@@ -1722,6 +1775,7 @@ mod tests {
         LighterExecutionClient::process_ws_message(
             accepted.to_ws_message(),
             &orders,
+            &reconciler,
             ClientId::from("LIGHTER"),
             AccountId::from("LIGHTER-001"),
         )
@@ -1743,10 +1797,12 @@ mod tests {
             timestamp: fixtures.account.timestamp_ms,
         };
         let orders = DashMap::new();
+        let reconciler = Arc::new(Mutex::new(ExecutionReconciler::default()));
 
         LighterExecutionClient::process_ws_message(
             message,
             &orders,
+            &reconciler,
             ClientId::from("LIGHTER"),
             AccountId::from("LIGHTER-001"),
         )
@@ -1754,6 +1810,7 @@ mod tests {
         LighterExecutionClient::process_ws_message(
             InboundMessage::Pong,
             &orders,
+            &reconciler,
             ClientId::from("LIGHTER"),
             AccountId::from("LIGHTER-001"),
         )

@@ -33,6 +33,7 @@ pub enum DispatchOutcome {
         market_index: u16,
         status: OrderDispatchStatus,
         venue_status: String,
+        timestamp_ms: i64,
     },
     Account {
         address: String,
@@ -50,6 +51,7 @@ pub fn dispatch_private_message(message: &InboundMessage) -> DispatchOutcome {
             client_order_id,
             market_index,
             status,
+            timestamp,
             ..
         } => DispatchOutcome::Order {
             order_id: order_id.clone(),
@@ -57,6 +59,7 @@ pub fn dispatch_private_message(message: &InboundMessage) -> DispatchOutcome {
             market_index: *market_index,
             status: order_status_from_lighter(status),
             venue_status: status.clone(),
+            timestamp_ms: *timestamp,
         },
         InboundMessage::AccountUpdate {
             address,

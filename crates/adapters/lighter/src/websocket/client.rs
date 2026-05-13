@@ -824,6 +824,7 @@ mod tests {
                 market_index: filled_order.market_index,
                 status: OrderDispatchStatus::Filled,
                 venue_status: "filled".to_string(),
+                timestamp_ms: filled_order.timestamp_ms,
             }
         );
         assert_eq!(
