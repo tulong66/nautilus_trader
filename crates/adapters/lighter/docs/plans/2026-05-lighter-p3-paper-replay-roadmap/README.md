@@ -74,7 +74,7 @@ Post-P3 safety-reviewed live-prep
 | P3-C | Failure scenario replay pack | [x] | P3-A | `PaperReplayFailureScenario` covers disconnect/resubscribe, duplicate messages, stale updates, empty account/orders, mock report error, retry exhaustion, and sequencer non-filled states; focused test `failure_replay_pack` passed |
 | P3-D | Paper accounting consistency checks | [x] | P3-A/P3-B | `check_paper_accounting_consistency` compares replay fills/positions/account state with report snapshots and emits deterministic mismatch diagnostics; focused `paper_accounting_consistency` tests passed |
 | P3-E | Safety review entry criteria | [x] | P3-B/P3-C/P3-D | `safety-review-entry.zh-CN.md` defines what evidence is required before any future testnet/private credential design may start; does not approve live work |
-| P3-F | P3 verification and docs | [ ] | P3-A-E | Full Rust tests, Python feature check, Python smoke when available, safety searches, and docs/status updates pass |
+| P3-F | P3 verification and docs | [x] | P3-A-E | Full Rust tests, Python feature check, Python smoke when available, safety searches, and docs/status updates pass; completed 2026-05-15 |
 
 ## Suggested execution workflow
 

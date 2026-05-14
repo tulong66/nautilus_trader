@@ -56,7 +56,7 @@ P3 MVP proves that deterministic paper/replay workflows can consume Lighter adap
   - Defines required evidence for any future testnet/private credential design: P2/P3 verification, credential lifecycle design, no-log guarantees, explicit human approval, and separate security review.
   - _Requirements: US-5_
 
-- [ ] P3-F. Run P3 verification and update status
+- [x] P3-F. Run P3 verification and update status
   - Run focused replay/audit tests.
   - Run full Rust crate tests.
   - Run Python feature check.

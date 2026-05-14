@@ -1,7 +1,7 @@
 # Lighter DEX Adapter - 开发状态报告
 
-> **最后更新**: 2026-05-13
-> **状态**: ✅ P2-R 验证与文档收尾完成；adapter 保持受控 live-prep / paper-replay-ready 状态，未推进真实资金路径
+> **最后更新**: 2026-05-15
+> **状态**: ✅ P3-F verification complete — adapter Stage 0 ready；paper/replay 路径已验证，live 路径安全门控，未推进真实资金路径
 
 ---
 
@@ -87,9 +87,46 @@
 - [x] P3-C Failure scenario replay pack：已新增 `PaperReplayFailureScenario`，fixture-backed/in-memory 覆盖 disconnect/resubscribe、duplicate messages、stale updates、empty account/orders、mock report error、retry exhaustion、sequencer non-filled states；focused `failure_replay_pack` 测试通过。
 - [x] P3-D Paper accounting consistency checks：已新增 `check_paper_accounting_consistency`，比较 replay-derived fills/positions/account state 与 report-derived snapshot，并输出确定性 fill/position 与 account timestamp mismatch diagnostics；focused success/mismatch tests 通过。
 - [x] P3-E Safety review entry criteria：已新增 `safety-review-entry.zh-CN.md`，明确 P3 paper/replay 不等于 live/testnet 授权，并定义未来 testnet/private credential 设计前的安全审查入口标准。
-- [ ] P3-F P3 verification and docs：待 P3-C/D 完成后统一收尾验证。
+- [x] P3-F P3 verification and docs：P3-A～P3-E 全部完成后统一收尾验证，2026-05-15 完成。P3 各子任务状态见下方"P3 收尾摘要"。
 - [ ] maker-vs-taking / quote skew 研究仅在 signal-driven execution 明确需要后推进。
 - [ ] 真实 testnet/private credential 流程只在 P3 完成并人工批准后另起安全审计任务。
+
+---
+
+### P3 收尾摘要（2026-05-15）
+
+#### P3 各子任务完成状态
+
+| ID | 任务 | 状态 |
+|----|------|------|
+| P3-A | Paper/replay integration harness | [x] 完成 |
+| P3-B | Operator audit summary | [x] 完成 |
+| P3-C | Failure scenario replay pack | [x] 完成 |
+| P3-D | Paper accounting consistency checks | [x] 完成 |
+| P3-E | Safety review entry criteria | [x] 完成 |
+| P3-F | P3 verification and docs | [x] 完成（本项） |
+
+P3 全部 6 项子任务已完成，P2-R 验证基线（Rust 测试 147 passed / 2 ignored，集成测试 43 passed，doctest 1 passed / 3 ignored，Python smoke 3 passed）在 P3 实施前已通过，P3 各子任务均通过 focused tests 验收。
+
+#### Adapter 整体状态：Stage 0 ready（paper/replay 路径已就绪）
+
+- P0 全部完成：workspace 注册、PyO3 子模块、factory/config、Python 包装层、Python smoke test。
+- P1 全部完成（A～I）：execution fixtures、WS order/account dispatch、order/fill/position reports、execution client wiring、market cache、signing surface audit、verification。最终 Rust 测试 129 passed / 2 ignored，Python smoke 3 passed。
+- P2 全部完成（J～R）：live signing gate、private WS dry-run、mock report source、reconciliation 状态机、sequencer 语义建模、retry/rate-limit 策略、funding/margin/liquidation 风险输入（只读）、soak 验证。最终 Rust 测试 147 passed / 2 ignored，集成 43 passed，doctest 1 passed。
+- P3 全部完成（A～F）：paper/replay integration harness、operator audit summary、failure scenario replay pack、paper accounting consistency checks、safety review entry criteria、P3 verification and docs。
+
+#### 关键安全边界确认
+
+- no private keys：adapter 不读取 `.env`、wallet 文件、私钥文件、API key 文件、keyring、KMS 或 credential managers。
+- no real funds：不调用 Lighter mainnet 下单、撤单、提现、转账、leverage/margin 操作或任何真实资金动作。
+- no real orders：所有测试均为 fixture-backed / mock-backed / in-memory，不连接真实 private WS。
+- `enable_live_signing` 默认关闭：`LighterExecClientConfig.enable_live_signing` 默认 `false`；`connect()` 在任何 HTTP/private WS/auth token 前拒绝默认配置；strategy signing surface 只暴露 create order / cancel order / cancel all / auth token，不含 withdraw/transfer/leverage/margin。
+
+#### 接口稳定性说明
+
+- Python factory/config 接口（`LighterDataClientFactory`、`LighterExecutionClientFactory`、`LighterExecFactoryConfig`、`LighterDataClientConfig`、`LighterExecClientConfig`）已稳定，Python import smoke 3 passed。
+- Rust execution / dispatch / reconciliation / reports / replay / audit 模块接口已通过 P3 focused tests 验收，可供 Track C Layer 4 整合使用。
+- 下一步需要进入真实资金路径前，必须通过独立安全审查（参见 `docs/plans/2026-05-lighter-p3-paper-replay-roadmap/safety-review-entry.zh-CN.md`）并获得人工明确批准。
 
 ---
 
