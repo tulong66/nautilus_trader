@@ -42,7 +42,7 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::{FromPrimitive, ToPrimitive}, Decimal};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -525,6 +525,21 @@ struct OrderConversionMetadata {
     min_quantity: Option<f64>,
     price_increment: f64,
     size_increment: f64,
+    price_increment_raw: Option<u64>,
+    size_increment_raw: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderRequestFields {
+    client_order_index: i64,
+    base_amount: i64,
+    price: u32,
+    is_ask: bool,
+    order_type: u8,
+    time_in_force: u8,
+    reduce_only: bool,
+    trigger_price: u32,
+    order_expiry: i64,
 }
 
 impl LighterExecutionClient {
@@ -737,13 +752,73 @@ impl LighterExecutionClient {
             )
         })?;
 
+        let price_decimals = instrument.price_precision();
+        let size_decimals = instrument.size_precision();
+        let price_increment = instrument.price_increment().as_f64();
+        let size_increment = instrument.size_increment().as_f64();
+
         Ok(OrderConversionMetadata {
-            price_decimals: instrument.price_precision(),
-            size_decimals: instrument.size_precision(),
+            price_decimals,
+            size_decimals,
             min_quantity: instrument.min_quantity().map(|qty| qty.as_f64()),
-            price_increment: instrument.price_increment().as_f64(),
-            size_increment: instrument.size_increment().as_f64(),
+            price_increment,
+            size_increment,
+            price_increment_raw: Some(
+                Self::decimal_to_raw_checked(price_increment, price_decimals, "price_increment")?
+                    as u64,
+            ),
+            size_increment_raw: Some(
+                Self::decimal_to_raw_checked(size_increment, size_decimals, "size_increment")?
+                    as u64,
+            ),
         })
+    }
+
+    fn decimal_value_to_raw_checked(
+        decimal: Decimal,
+        decimals: u8,
+        field_name: &str,
+    ) -> anyhow::Result<i64> {
+        let scale = Decimal::from(10u64.pow(decimals as u32));
+        let raw = decimal * scale;
+
+        if raw.fract() != Decimal::ZERO {
+            anyhow::bail!(
+                "Lighter {field_name} {decimal} exceeds {decimals} decimal places",
+            );
+        }
+        let raw = raw
+            .to_i64()
+            .ok_or_else(|| anyhow::anyhow!("Lighter {field_name} {decimal} raw conversion overflow"))?;
+        if raw < 0 {
+            anyhow::bail!("Lighter {field_name} {decimal} raw conversion is negative");
+        }
+        Ok(raw)
+    }
+
+    fn decimal_to_raw_checked(value: f64, decimals: u8, field_name: &str) -> anyhow::Result<i64> {
+        let decimal = Decimal::from_f64(value)
+            .ok_or_else(|| anyhow::anyhow!("Lighter {field_name} {value} is not finite"))?;
+        Self::decimal_value_to_raw_checked(decimal, decimals, field_name)
+    }
+
+    fn validate_raw_increment(
+        raw: i64,
+        increment_raw: Option<u64>,
+        field_name: &str,
+    ) -> anyhow::Result<()> {
+        let Some(increment_raw) = increment_raw else {
+            return Ok(());
+        };
+        if increment_raw == 0 {
+            anyhow::bail!("Lighter {field_name} increment raw must be positive");
+        }
+        if raw % increment_raw as i64 != 0 {
+            anyhow::bail!(
+                "Lighter {field_name} raw value {raw} is not divisible by increment raw {increment_raw}",
+            );
+        }
+        Ok(())
     }
 
     fn validate_order_against_metadata(
@@ -774,7 +849,90 @@ impl LighterExecutionClient {
             );
         }
 
+        if let Some(price) = order.price() {
+            let price_raw = Self::decimal_value_to_raw_checked(
+                price.as_decimal(),
+                metadata.price_decimals,
+                "order price",
+            )?;
+            Self::validate_raw_increment(price_raw, metadata.price_increment_raw, "order price")?;
+        }
+        if let Some(trigger_price) = order.trigger_price() {
+            let trigger_price_raw = Self::decimal_value_to_raw_checked(
+                trigger_price.as_decimal(),
+                metadata.price_decimals,
+                "trigger price",
+            )?;
+            Self::validate_raw_increment(
+                trigger_price_raw,
+                metadata.price_increment_raw,
+                "trigger price",
+            )?;
+        }
+        let quantity_raw = Self::decimal_value_to_raw_checked(
+            order.quantity().as_decimal(),
+            metadata.size_decimals,
+            "order quantity",
+        )?;
+        Self::validate_raw_increment(
+            quantity_raw,
+            metadata.size_increment_raw,
+            "order quantity",
+        )?;
+
         Ok(())
+    }
+
+    fn build_order_request_fields(
+        order: &OrderAny,
+        metadata: OrderConversionMetadata,
+    ) -> anyhow::Result<OrderRequestFields> {
+        Self::validate_order_against_metadata(order, metadata)?;
+        let client_order_index = order
+            .client_order_id()
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or_else(|_| {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                order.client_order_id().hash(&mut hasher);
+                (hasher.finish() as i64).abs()
+            });
+        let price = if let Some(price) = order.price() {
+            Self::decimal_value_to_raw_checked(price.as_decimal(), metadata.price_decimals, "order price")?
+                as u32
+        } else {
+            0
+        };
+        let trigger_price = if let Some(trigger_price) = order.trigger_price() {
+            Self::decimal_value_to_raw_checked(
+                trigger_price.as_decimal(),
+                metadata.price_decimals,
+                "trigger price",
+            )? as u32
+        } else {
+            0
+        };
+
+        Ok(OrderRequestFields {
+            client_order_index,
+            base_amount: Self::decimal_value_to_raw_checked(
+                order.quantity().as_decimal(),
+                metadata.size_decimals,
+                "order quantity",
+            )?,
+            price,
+            is_ask: Self::order_side_to_is_ask(order),
+            order_type: Self::convert_order_type(order),
+            time_in_force: Self::convert_time_in_force(order),
+            reduce_only: order.is_reduce_only(),
+            trigger_price,
+            order_expiry: order
+                .expire_time()
+                .map(|t| t.as_i64() / 1_000_000_000)
+                .unwrap_or(0),
+        })
     }
 
     #[allow(dead_code)]
@@ -809,6 +967,7 @@ impl LighterExecutionClient {
     ///
     /// Lighter uses integer prices with implied decimals (price_decimals).
     /// For example, ETH with 2 decimals: $4127.39 -> 412739
+    #[cfg(test)]
     fn convert_price_to_raw(price: f64, price_decimals: u8) -> u32 {
         let multiplier = 10f64.powi(price_decimals as i32);
         (price * multiplier) as u32
@@ -818,6 +977,7 @@ impl LighterExecutionClient {
     ///
     /// Lighter uses integer quantities with implied decimals (size_decimals).
     /// For example, 1.5 ETH with 8 decimals -> 150000000
+    #[cfg(test)]
     fn convert_quantity_to_raw(quantity: f64, size_decimals: u8) -> i64 {
         let multiplier = 10f64.powi(size_decimals as i32);
         (quantity * multiplier) as i64
@@ -1218,37 +1378,9 @@ impl ExecutionClient for LighterExecutionClient {
             }
         };
 
-        // Extract order parameters
-        let client_order_index = order
-            .client_order_id()
-            .to_string()
-            .parse::<i64>()
-            .unwrap_or_else(|_| {
-                // Generate a unique ID from hash if not numeric
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                order.client_order_id().hash(&mut hasher);
-                (hasher.finish() as i64).abs()
-            });
-
-        // Get price and quantity based on cached instrument metadata.
+        // Get order request fields based on cached instrument metadata.
         let conversion_metadata = self.conversion_metadata_for_order(&order)?;
-        Self::validate_order_against_metadata(&order, conversion_metadata)?;
-        let price_raw = if let Some(price) = order.price() {
-            Self::convert_price_to_raw(price.as_f64(), conversion_metadata.price_decimals)
-        } else {
-            0 // Market orders don't have price
-        };
-
-        let quantity_raw = Self::convert_quantity_to_raw(
-            order.quantity().as_f64(),
-            conversion_metadata.size_decimals,
-        );
-        let is_ask = Self::order_side_to_is_ask(&order);
-        let order_type = Self::convert_order_type(&order);
-        let time_in_force = Self::convert_time_in_force(&order);
-        let reduce_only = order.is_reduce_only();
+        let request_fields = Self::build_order_request_fields(&order, conversion_metadata)?;
 
         // Calculate transaction expiry (default: 60 seconds from now)
         let expired_at = std::time::SystemTime::now()
@@ -1257,28 +1389,18 @@ impl ExecutionClient for LighterExecutionClient {
             .as_millis() as i64
             + 60_000; // 60 seconds expiry
 
-        // Get trigger price and order expiry from order if available
-        let trigger_price = order
-            .trigger_price()
-            .map(|p| Self::convert_price_to_raw(p.as_f64(), conversion_metadata.price_decimals))
-            .unwrap_or(0);
-        let order_expiry = order
-            .expire_time()
-            .map(|t| t.as_i64() / 1_000_000_000) // Convert nanos to seconds
-            .unwrap_or(0);
-
         // Sign the order transaction
         let (signed_tx, nonce) = match self.signer.sign_create_order(
             market_index,
-            client_order_index,
-            quantity_raw,
-            price_raw,
-            is_ask,
-            order_type,
-            time_in_force,
-            reduce_only,
-            trigger_price,
-            order_expiry,
+            request_fields.client_order_index,
+            request_fields.base_amount,
+            request_fields.price,
+            request_fields.is_ask,
+            request_fields.order_type,
+            request_fields.time_in_force,
+            request_fields.reduce_only,
+            request_fields.trigger_price,
+            request_fields.order_expiry,
             expired_at,
         ) {
             Ok(result) => result,
@@ -1308,13 +1430,13 @@ impl ExecutionClient for LighterExecutionClient {
         // Build HTTP request
         let request = CreateOrderRequest {
             market_index,
-            client_order_index,
-            base_amount: quantity_raw,
-            price: price_raw,
-            is_ask,
-            order_type,
-            time_in_force,
-            reduce_only,
+            client_order_index: request_fields.client_order_index,
+            base_amount: request_fields.base_amount,
+            price: request_fields.price,
+            is_ask: request_fields.is_ask,
+            order_type: request_fields.order_type,
+            time_in_force: request_fields.time_in_force,
+            reduce_only: request_fields.reduce_only,
             nonce,
             signature: signed_tx.signature,
         };
@@ -2570,6 +2692,8 @@ mod tests {
             min_quantity: Some(0.0001),
             price_increment: 0.01,
             size_increment: 0.00000001,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(1),
         };
 
         let err = LighterExecutionClient::validate_order_against_metadata(&order, metadata)
@@ -2600,10 +2724,182 @@ mod tests {
             min_quantity: Some(0.0001),
             price_increment: 0.01,
             size_increment: 0.00000001,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(1),
         };
 
         LighterExecutionClient::validate_order_against_metadata(&order, metadata)
             .expect("min-size order should pass preflight");
+    }
+
+    #[test]
+    fn decimal_to_raw_checked_rejects_extra_precision() {
+        let err = LighterExecutionClient::decimal_to_raw_checked(0.00015, 4, "quantity")
+            .expect_err("extra precision must be rejected");
+
+        assert!(
+            err.to_string().contains("exceeds 4 decimal places"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_order_against_metadata_accepts_btc_like_tick_and_step() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.1, 1))
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 1,
+            size_decimals: 4,
+            min_quantity: Some(0.0001),
+            price_increment: 0.1,
+            size_increment: 0.0001,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(1),
+        };
+
+        LighterExecutionClient::validate_order_against_metadata(&order, metadata)
+            .expect("BTC-like tick/step should pass preflight");
+    }
+
+    #[test]
+    fn validate_order_against_metadata_rejects_price_not_on_tick() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("ETH_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.125"))
+            .price(Price::new(100_000.15, 2))
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 2,
+            size_decimals: 3,
+            min_quantity: Some(0.001),
+            price_increment: 0.1,
+            size_increment: 0.001,
+            price_increment_raw: Some(10),
+            size_increment_raw: Some(1),
+        };
+
+        let err = LighterExecutionClient::validate_order_against_metadata(&order, metadata)
+            .expect_err("off-tick price must fail preflight");
+
+        assert!(
+            err.to_string().contains("not divisible by increment raw"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_order_against_metadata_rejects_quantity_not_on_step() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("ETH_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.125"))
+            .price(Price::new(100_000.1, 1))
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 1,
+            size_decimals: 3,
+            min_quantity: Some(0.001),
+            price_increment: 0.1,
+            size_increment: 0.01,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(10),
+        };
+
+        let err = LighterExecutionClient::validate_order_against_metadata(&order, metadata)
+            .expect_err("off-step quantity must fail preflight");
+
+        assert!(
+            err.to_string().contains("not divisible by increment raw"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn build_order_request_fields_builds_post_only_btc_request_without_signing() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.1, 1))
+            .post_only(true)
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 1,
+            size_decimals: 4,
+            min_quantity: Some(0.0001),
+            price_increment: 0.1,
+            size_increment: 0.0001,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(1),
+        };
+
+        let fields = LighterExecutionClient::build_order_request_fields(&order, metadata)
+            .expect("request fields");
+
+        assert_eq!(fields.base_amount, 1);
+        assert_eq!(fields.price, 1_000_001);
+        assert!(!fields.is_ask);
+        assert_eq!(fields.time_in_force, LighterSigner::TIF_POST_ONLY);
+        assert!(!fields.reduce_only);
+    }
+
+    #[test]
+    fn build_order_request_fields_builds_sell_reduce_only_eth_request_without_signing() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("ETH_USDC.LIGHTER"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.125"))
+            .price(Price::new(4_127.39, 2))
+            .reduce_only(true)
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 2,
+            size_decimals: 3,
+            min_quantity: Some(0.001),
+            price_increment: 0.01,
+            size_increment: 0.001,
+            price_increment_raw: Some(1),
+            size_increment_raw: Some(1),
+        };
+
+        let fields = LighterExecutionClient::build_order_request_fields(&order, metadata)
+            .expect("request fields");
+
+        assert_eq!(fields.base_amount, 125);
+        assert_eq!(fields.price, 412_739);
+        assert!(fields.is_ask);
+        assert_eq!(fields.time_in_force, LighterSigner::TIF_GOOD_TILL_TIME);
+        assert!(fields.reduce_only);
     }
 
     #[test]
