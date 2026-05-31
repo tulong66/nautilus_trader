@@ -416,6 +416,71 @@ fn reconciles_send_order_update_fill_cancel_and_cancel_reject_replay() {
         reconciler.order_status(cancel_rejected.client_order_id),
         Some(ReconciledOrderStatus::CancelRejected)
     );
+    assert!(reconciler.has_reconciliation_risk());
+    let risky = reconciler.orders_requiring_reconciliation();
+    assert!(risky.iter().any(|(client_order_id, status)| {
+        client_order_id == accepted.client_order_id
+            && matches!(status, ReconciledOrderStatus::Accepted)
+    }));
+    assert!(risky.iter().any(|(client_order_id, status)| {
+        client_order_id == cancel_rejected.client_order_id
+            && matches!(status, ReconciledOrderStatus::CancelRejected)
+    }));
+
+    let accepted_canceled_message = InboundMessage::OrderUpdate {
+        order_id: accepted.order_id.to_string(),
+        client_order_id: Some(accepted.client_order_id.to_string()),
+        market_index: accepted.market_index,
+        status: "canceled".to_string(),
+        side: accepted.side.to_string(),
+        order_type: accepted.order_type.to_string(),
+        price: accepted.price.to_string(),
+        quantity: accepted.quantity.to_string(),
+        filled_quantity: accepted.filled_quantity.to_string(),
+        timestamp: accepted.timestamp_ms + 1,
+    };
+    assert_eq!(
+        reconciler.apply_dispatch(&dispatch_private_message(&accepted_canceled_message)),
+        ReconciliationAction::Accepted
+    );
+    assert!(reconciler.has_reconciliation_risk());
+
+    let cancel_rejected_canceled_message = InboundMessage::OrderUpdate {
+        order_id: cancel_rejected.order_id.to_string(),
+        client_order_id: Some(cancel_rejected.client_order_id.to_string()),
+        market_index: cancel_rejected.market_index,
+        status: "canceled".to_string(),
+        side: cancel_rejected.side.to_string(),
+        order_type: cancel_rejected.order_type.to_string(),
+        price: cancel_rejected.price.to_string(),
+        quantity: cancel_rejected.quantity.to_string(),
+        filled_quantity: cancel_rejected.filled_quantity.to_string(),
+        timestamp: cancel_rejected.timestamp_ms + 1,
+    };
+    assert_eq!(
+        reconciler.apply_dispatch(&dispatch_private_message(&cancel_rejected_canceled_message)),
+        ReconciliationAction::Accepted
+    );
+    assert!(reconciler.has_reconciliation_risk());
+
+    let partial_filled_message = InboundMessage::OrderUpdate {
+        order_id: partial.order_id.to_string(),
+        client_order_id: Some(partial.client_order_id.to_string()),
+        market_index: partial.market_index,
+        status: "filled".to_string(),
+        side: partial.side.to_string(),
+        order_type: partial.order_type.to_string(),
+        price: partial.price.to_string(),
+        quantity: partial.quantity.to_string(),
+        filled_quantity: partial.quantity.to_string(),
+        timestamp: partial.timestamp_ms + 1,
+    };
+    assert_eq!(
+        reconciler.apply_dispatch(&dispatch_private_message(&partial_filled_message)),
+        ReconciliationAction::Accepted
+    );
+    assert!(!reconciler.has_reconciliation_risk());
+    assert!(reconciler.orders_requiring_reconciliation().is_empty());
 
     let account_message = InboundMessage::AccountUpdate {
         address: fixtures.account.address.clone(),

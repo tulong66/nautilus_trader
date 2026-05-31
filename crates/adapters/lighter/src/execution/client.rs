@@ -54,7 +54,10 @@ use crate::{
     execution::{
         dispatch::dispatch_private_message,
         fixtures::execution_fixture_set,
-        reconciliation::{ExecutionReconciler, ReconciliationAction, interpret_send_tx_response},
+        reconciliation::{
+            ExecutionReconciler, ReconciledOrderStatus, ReconciliationAction,
+            interpret_send_tx_response,
+        },
         reports::{
             build_fill_report, build_mass_status, build_order_status_report,
             build_position_status_report,
@@ -515,6 +518,15 @@ struct OrderState {
     nonce: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OrderConversionMetadata {
+    price_decimals: u8,
+    size_decimals: u8,
+    min_quantity: Option<f64>,
+    price_increment: f64,
+    size_increment: f64,
+}
+
 impl LighterExecutionClient {
     /// Creates a new [`LighterExecutionClient`].
     ///
@@ -697,6 +709,10 @@ impl LighterExecutionClient {
 
     /// Convert NautilusTrader time-in-force to Lighter TIF.
     fn convert_time_in_force(order: &OrderAny) -> u8 {
+        if order.is_post_only() {
+            return LighterSigner::TIF_POST_ONLY;
+        }
+
         use nautilus_model::enums::TimeInForce;
         match order.time_in_force() {
             TimeInForce::Gtc => LighterSigner::TIF_GOOD_TILL_TIME,
@@ -707,6 +723,86 @@ impl LighterExecutionClient {
             TimeInForce::AtTheOpen => LighterSigner::TIF_GOOD_TILL_TIME,
             TimeInForce::AtTheClose => LighterSigner::TIF_GOOD_TILL_TIME,
         }
+    }
+
+    fn conversion_metadata_for_order(
+        &self,
+        order: &OrderAny,
+    ) -> anyhow::Result<OrderConversionMetadata> {
+        let instrument_id = order.instrument_id();
+        let instrument = self.instruments.get(&instrument_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Lighter instrument metadata unavailable for {}; cannot submit without price/size precision and min quantity preflight",
+                instrument_id,
+            )
+        })?;
+
+        Ok(OrderConversionMetadata {
+            price_decimals: instrument.price_precision(),
+            size_decimals: instrument.size_precision(),
+            min_quantity: instrument.min_quantity().map(|qty| qty.as_f64()),
+            price_increment: instrument.price_increment().as_f64(),
+            size_increment: instrument.size_increment().as_f64(),
+        })
+    }
+
+    fn validate_order_against_metadata(
+        order: &OrderAny,
+        metadata: OrderConversionMetadata,
+    ) -> anyhow::Result<()> {
+        let quantity = order.quantity().as_f64();
+        if let Some(min_quantity) = metadata.min_quantity {
+            if quantity < min_quantity {
+                anyhow::bail!(
+                    "Lighter order quantity {} is below instrument min quantity {}; refusing submit",
+                    quantity,
+                    min_quantity,
+                );
+            }
+        }
+
+        if metadata.price_increment <= 0.0 {
+            anyhow::bail!(
+                "Lighter instrument price increment {} must be positive",
+                metadata.price_increment,
+            );
+        }
+        if metadata.size_increment <= 0.0 {
+            anyhow::bail!(
+                "Lighter instrument size increment {} must be positive",
+                metadata.size_increment,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn orders_requiring_reconciliation_snapshot(
+        &self,
+    ) -> Vec<(String, ReconciledOrderStatus)> {
+        self.reconciler
+            .lock()
+            .expect(MUTEX_POISONED)
+            .orders_requiring_reconciliation()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ensure_no_reconciliation_risk(&self) -> anyhow::Result<()> {
+        let risky = self.orders_requiring_reconciliation_snapshot();
+        if !risky.is_empty() {
+            anyhow::bail!(
+                "Lighter reconciliation risk remains after cancel-all-on-exit: {:?}",
+                risky,
+            );
+        }
+        Ok(())
+    }
+
+    fn live_reports_unavailable_error(operation: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Lighter {operation} live report generation is not implemented; private WS-only state is insufficient for Strike 08 fail-closed reconciliation",
+        )
     }
 
     /// Convert price to Lighter raw integer format.
@@ -720,11 +816,10 @@ impl LighterExecutionClient {
 
     /// Convert quantity to Lighter raw integer format.
     ///
-    /// Lighter uses integer quantities with 8 decimal places.
-    /// For example, 1.5 ETH -> 150000000
-    fn convert_quantity_to_raw(quantity: f64) -> i64 {
-        const SIZE_DECIMALS: u8 = 8;
-        let multiplier = 10f64.powi(SIZE_DECIMALS as i32);
+    /// Lighter uses integer quantities with implied decimals (size_decimals).
+    /// For example, 1.5 ETH with 8 decimals -> 150000000
+    fn convert_quantity_to_raw(quantity: f64, size_decimals: u8) -> i64 {
+        let multiplier = 10f64.powi(size_decimals as i32);
         (quantity * multiplier) as i64
     }
 
@@ -1137,15 +1232,19 @@ impl ExecutionClient for LighterExecutionClient {
                 (hasher.finish() as i64).abs()
             });
 
-        // Get price and quantity based on order type
-        let price_decimals: u8 = 2; // Default, should come from instrument
+        // Get price and quantity based on cached instrument metadata.
+        let conversion_metadata = self.conversion_metadata_for_order(&order)?;
+        Self::validate_order_against_metadata(&order, conversion_metadata)?;
         let price_raw = if let Some(price) = order.price() {
-            Self::convert_price_to_raw(price.as_f64(), price_decimals)
+            Self::convert_price_to_raw(price.as_f64(), conversion_metadata.price_decimals)
         } else {
             0 // Market orders don't have price
         };
 
-        let quantity_raw = Self::convert_quantity_to_raw(order.quantity().as_f64());
+        let quantity_raw = Self::convert_quantity_to_raw(
+            order.quantity().as_f64(),
+            conversion_metadata.size_decimals,
+        );
         let is_ask = Self::order_side_to_is_ask(&order);
         let order_type = Self::convert_order_type(&order);
         let time_in_force = Self::convert_time_in_force(&order);
@@ -1161,7 +1260,7 @@ impl ExecutionClient for LighterExecutionClient {
         // Get trigger price and order expiry from order if available
         let trigger_price = order
             .trigger_price()
-            .map(|p| Self::convert_price_to_raw(p.as_f64(), price_decimals))
+            .map(|p| Self::convert_price_to_raw(p.as_f64(), conversion_metadata.price_decimals))
             .unwrap_or(0);
         let order_expiry = order
             .expire_time()
@@ -1566,8 +1665,7 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
-            warn!("generate_order_status_report: live API not implemented");
-            return Ok(None);
+            return Err(Self::live_reports_unavailable_error("order status"));
         }
 
         warn!("generate_order_status_report: using explicit offline fixture report source");
@@ -1592,8 +1690,7 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
-            warn!("generate_order_status_reports: live API not implemented");
-            return Ok(Vec::new());
+            return Err(Self::live_reports_unavailable_error("order status reports"));
         }
 
         warn!("generate_order_status_reports: using explicit offline fixture report source");
@@ -1617,8 +1714,7 @@ impl ExecutionClient for LighterExecutionClient {
         }
 
         if !is_offline_fixture_report_request(cmd.params.as_ref()) {
-            warn!("generate_fill_reports: live API not implemented");
-            return Ok(Vec::new());
+            return Err(Self::live_reports_unavailable_error("fill reports"));
         }
 
         warn!("generate_fill_reports: using explicit offline fixture report source");
@@ -2341,6 +2437,237 @@ mod tests {
     fn test_client_creation() {
         // This test would need a valid private key and core setup
         // Placeholder for future implementation
+    }
+
+    #[test]
+    fn convert_time_in_force_maps_post_only_order_flag_to_lighter_tif_3() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType, TimeInForce},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.0, 2))
+            .time_in_force(TimeInForce::Gtc)
+            .post_only(true)
+            .build();
+
+        assert!(order.is_post_only());
+        assert_eq!(
+            LighterExecutionClient::convert_time_in_force(&order),
+            LighterSigner::TIF_POST_ONLY,
+        );
+    }
+
+    #[test]
+    fn convert_time_in_force_preserves_non_post_only_tif_mapping() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType, TimeInForce},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let cases = [
+            (TimeInForce::Gtc, LighterSigner::TIF_GOOD_TILL_TIME),
+            (TimeInForce::Ioc, LighterSigner::TIF_IMMEDIATE_OR_CANCEL),
+            (TimeInForce::Fok, LighterSigner::TIF_FILL_OR_KILL),
+            (TimeInForce::Gtd, LighterSigner::TIF_GOOD_TILL_TIME),
+            (TimeInForce::Day, LighterSigner::TIF_GOOD_TILL_TIME),
+            (TimeInForce::AtTheOpen, LighterSigner::TIF_GOOD_TILL_TIME),
+            (TimeInForce::AtTheClose, LighterSigner::TIF_GOOD_TILL_TIME),
+        ];
+
+        for (time_in_force, expected) in cases {
+            let mut builder = OrderTestBuilder::new(OrderType::Limit);
+            builder
+                .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("0.0001"))
+                .price(Price::new(100_000.0, 2))
+                .time_in_force(time_in_force)
+                .post_only(false);
+            if time_in_force == TimeInForce::Gtd {
+                builder.expire_time(UnixNanos::from(1_000_000_000));
+            }
+            let order = builder.build();
+
+            assert!(!order.is_post_only());
+            assert_eq!(
+                LighterExecutionClient::convert_time_in_force(&order),
+                expected,
+                "unexpected mapping for {time_in_force:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn convert_price_to_raw_uses_supplied_price_precision() {
+        assert_eq!(
+            LighterExecutionClient::convert_price_to_raw(100_000.1, 1),
+            1_000_001,
+        );
+        assert_eq!(
+            LighterExecutionClient::convert_price_to_raw(100_000.12, 2),
+            10_000_012,
+        );
+    }
+
+    #[test]
+    fn convert_quantity_to_raw_uses_supplied_size_precision() {
+        assert_eq!(
+            LighterExecutionClient::convert_quantity_to_raw(0.0001, 4),
+            1,
+        );
+        assert_eq!(
+            LighterExecutionClient::convert_quantity_to_raw(0.0001, 8),
+            10_000,
+        );
+    }
+
+    #[test]
+    fn conversion_metadata_for_order_fails_closed_when_instrument_missing() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let client = test_execution_client();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.0, 2))
+            .build();
+
+        let err = client
+            .conversion_metadata_for_order(&order)
+            .expect_err("missing instrument metadata must block live submit conversion");
+
+        assert!(
+            err.to_string().contains("instrument metadata unavailable"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_order_against_metadata_rejects_below_min_quantity() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.00005"))
+            .price(Price::new(100_000.0, 2))
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 2,
+            size_decimals: 8,
+            min_quantity: Some(0.0001),
+            price_increment: 0.01,
+            size_increment: 0.00000001,
+        };
+
+        let err = LighterExecutionClient::validate_order_against_metadata(&order, metadata)
+            .expect_err("below-min-size order must fail preflight");
+
+        assert!(
+            err.to_string().contains("below instrument min quantity"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_order_against_metadata_accepts_min_quantity() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.0, 2))
+            .build();
+        let metadata = OrderConversionMetadata {
+            price_decimals: 2,
+            size_decimals: 8,
+            min_quantity: Some(0.0001),
+            price_increment: 0.01,
+            size_increment: 0.00000001,
+        };
+
+        LighterExecutionClient::validate_order_against_metadata(&order, metadata)
+            .expect("min-size order should pass preflight");
+    }
+
+    #[test]
+    fn live_reports_unavailable_error_is_explicitly_fail_closed() {
+        let err = LighterExecutionClient::live_reports_unavailable_error("order status");
+        let msg = err.to_string();
+
+        assert!(msg.contains("live report generation is not implemented"));
+        assert!(msg.contains("fail-closed reconciliation"));
+    }
+
+    #[test]
+    fn ensure_no_reconciliation_risk_allows_empty_reconciler() {
+        let client = test_execution_client();
+
+        client
+            .ensure_no_reconciliation_risk()
+            .expect("empty reconciler should be clean");
+    }
+
+    #[test]
+    fn ensure_no_reconciliation_risk_rejects_open_order_state() {
+        let client = test_execution_client();
+
+        {
+            let mut reconciler = client.reconciler.lock().expect(MUTEX_POISONED);
+            reconciler.record_order_status_for_test(
+                "strike08_probe_open_001",
+                ReconciledOrderStatus::Accepted,
+            );
+        }
+
+        let err = client
+            .ensure_no_reconciliation_risk()
+            .expect_err("accepted order must remain risky until terminal reconciliation");
+
+        assert!(
+            err.to_string().contains("reconciliation risk remains"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn post_only_conversion_does_not_require_live_signing_opt_in() {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::builder::OrderTestBuilder,
+        };
+
+        let client = test_execution_client();
+        assert!(!client.config.enable_live_signing);
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTC_USDC.LIGHTER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.0001"))
+            .price(Price::new(100_000.0, 2))
+            .post_only(true)
+            .build();
+
+        assert_eq!(
+            LighterExecutionClient::convert_time_in_force(&order),
+            LighterSigner::TIF_POST_ONLY,
+        );
     }
 
     #[test]

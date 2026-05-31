@@ -36,6 +36,28 @@ pub enum ReconciledOrderStatus {
     CancelRejected,
 }
 
+impl ReconciledOrderStatus {
+    #[must_use]
+    pub fn requires_reconciliation(self) -> bool {
+        matches!(
+            self,
+            Self::Sent
+                | Self::Submitted
+                | Self::Accepted
+                | Self::Pending
+                | Self::Timeout
+                | Self::PartiallyFilled
+                | Self::CancelPending
+                | Self::CancelRejected
+        )
+    }
+
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Executed | Self::Filled | Self::Canceled | Self::Rejected)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReconciliationAction {
     Accepted,
@@ -308,6 +330,43 @@ impl ExecutionReconciler {
     }
 
     #[must_use]
+    pub fn orders_requiring_reconciliation(&self) -> Vec<(String, ReconciledOrderStatus)> {
+        self.orders
+            .iter()
+            .filter_map(|(client_order_id, state)| {
+                state
+                    .status
+                    .requires_reconciliation()
+                    .then(|| (client_order_id.clone(), state.status))
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn has_reconciliation_risk(&self) -> bool {
+        self.orders
+            .values()
+            .any(|state| state.status.requires_reconciliation())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_order_status_for_test(
+        &mut self,
+        client_order_id: impl Into<String>,
+        status: ReconciledOrderStatus,
+    ) {
+        self.orders.insert(
+            client_order_id.into(),
+            ReconciledOrderState {
+                status,
+                market_index: 0,
+                last_timestamp_ms: 0,
+                venue_order_id: None,
+            },
+        );
+    }
+
+    #[must_use]
     pub fn account_timestamp(&self, address: &str) -> Option<i64> {
         self.accounts.get(address).copied()
     }
@@ -368,6 +427,44 @@ fn reconciled_status_from_dispatch(status: OrderDispatchStatus) -> ReconciledOrd
         OrderDispatchStatus::Filled => ReconciledOrderStatus::Filled,
         OrderDispatchStatus::Canceled => ReconciledOrderStatus::Canceled,
         OrderDispatchStatus::CancelRejected => ReconciledOrderStatus::CancelRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconciled_order_status_classifies_terminal_and_risk_states() {
+        assert!(ReconciledOrderStatus::Executed.is_terminal());
+        assert!(ReconciledOrderStatus::Filled.is_terminal());
+        assert!(ReconciledOrderStatus::Canceled.is_terminal());
+        assert!(ReconciledOrderStatus::Rejected.is_terminal());
+
+        assert!(!ReconciledOrderStatus::Executed.requires_reconciliation());
+        assert!(!ReconciledOrderStatus::Filled.requires_reconciliation());
+        assert!(!ReconciledOrderStatus::Canceled.requires_reconciliation());
+        assert!(!ReconciledOrderStatus::Rejected.requires_reconciliation());
+
+        assert!(ReconciledOrderStatus::Sent.requires_reconciliation());
+        assert!(ReconciledOrderStatus::Submitted.requires_reconciliation());
+        assert!(ReconciledOrderStatus::Accepted.requires_reconciliation());
+        assert!(ReconciledOrderStatus::Pending.requires_reconciliation());
+        assert!(ReconciledOrderStatus::Timeout.requires_reconciliation());
+        assert!(ReconciledOrderStatus::PartiallyFilled.requires_reconciliation());
+        assert!(ReconciledOrderStatus::CancelPending.requires_reconciliation());
+        assert!(ReconciledOrderStatus::CancelRejected.requires_reconciliation());
+    }
+
+    #[test]
+    fn reconciler_reports_orders_requiring_reconciliation() {
+        let mut reconciler = ExecutionReconciler::default();
+        reconciler.record_order_status_for_test("OPEN", ReconciledOrderStatus::Accepted);
+        reconciler.record_order_status_for_test("DONE", ReconciledOrderStatus::Canceled);
+
+        assert!(reconciler.has_reconciliation_risk());
+        let risky = reconciler.orders_requiring_reconciliation();
+        assert_eq!(risky, vec![("OPEN".to_string(), ReconciledOrderStatus::Accepted)]);
     }
 }
 
